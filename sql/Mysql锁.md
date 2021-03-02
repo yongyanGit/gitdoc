@@ -35,105 +35,151 @@
 意向锁不会阻塞除却全表请求(```lock table t write```)以外的任何请求。如```lock table write``` 是请求获取一个表级别的排它锁，会被```IS```或者```IX```阻塞：
 
 ```sql
-# session A
-begin;
-select * from t where a = 1 for update;//给请求的行加一个x锁
+--创建表
+--CREATE TABLE person (
+---id INT(11),
+---username VARCHAR(255),
+---birthday DATE
+--);
 
-# session B
+--初始化数据
+--insert into person(id,username,birthday) values (1,'yss','2020-01-13');
+
+--set @@autocommit=0; 关闭自动提交事务
+
+--使用consule来执行手动启动事务
+--session A
 begin;
-lock table t write; //session A释放锁之前，SessionB会一直阻塞
+select * from person where id = 1 for update; --给请求的行加一个x锁
+
+--session B
+begin;
+lock table person write; --session A释放锁之前，SessionB会一直阻塞
 ```
 
-如上```session A``` 需要获取```a=1```行的```X```锁，并且```session A```在获取行锁前，它必须获取```t```表的```IX```锁，行锁与意向锁不冲突，可以兼容。```session B```获取```t```的全表```x```锁，但是````session B```发现```t```表已经被设置了```IX```锁，```session B```被阻塞。
+如上```session A``` 需要获取```a=1```行的```X```锁，并且```session A```在获取行锁前，它必须获取```t```表的```IX```锁，行锁与意向锁不冲突，可以兼容。```session B```获取```t```的全表```x```锁，但是```session B```发现```t```表已经被设置了```IX```锁，```session B```被阻塞。
 
-在InnoDB Plugin之前，我们只能通过SHOW FULL PROCESSLIST、SHOW ENGINE INNODB STATUS等命令来查看当前数据库的请求，然后再判断当前事务中锁的情况。
+#### 锁监控
 
-新版本InnoDB Plugin中，在INFORMATION_SCHEMA架构下添加了INNODB_TRX 、INNODB_LOCKS、INNODB_WAITS。通过这三张表，可以简单的监控当前的事务并分析可能存在的锁问题。
+> show engine innodb status。查看当前锁请求信息。
 
-1）INNODB_TRX表
+```Mysql InnoDB``` 在```INFORMATION_SCHEMA```架构下添加了```INNODB_TRX``` 、```INNODB_LOCKS```、```INNODB_WAITS```三张表简单的监控当前的事务并分析可能存在的锁问题。
 
-* trx_id：InnoDB存储引擎内部唯一的事务ID.
-* trx_state：当前事务的状态。
-* trx_started：事务的开始时间
-* trx_request_lock_id：等待事务的锁ID，如trx_state的状态为LOCK WAIT ，那么该值代表当前的事务等待之前事务占用锁资源的ID。若trx_state不是LOCK WAIT，该值为null。
-* trx_wait_started：事务等待开始的时间
-* trx_weight：事务的权重，反应了一个事务修改和锁住的行数。在InnoDB中，当发生死锁需要回滚时，InnoDB会选择最小的进行回滚。
-* trx_mysql_thread_id ：Mysql中的线程ID。
-* trx_query：事务运行的SQL语句。
+1）```INNODB_TRX```表：查看当前数据库的事务运行情况。
 
- 如下例子：
+* ```trx_id```：```InnoDB```存储引擎内部唯一的事务```ID```.
+* ```trx_state```：当前事务的状态。
+* ```trx_started```：事务的开始时间
+* ```trx_request_lock_id```：等待事务的锁```ID```，如trx_state的状态为LOCK WAIT ，那么该值代表当前的事务等待之前事务占用锁资源的```ID```。若```trx_state```不是```LOCK WAIT```，该值```为null```。
+* ```trx_wait_started```：事务等待开始的时间
+* ```trx_weight```：事务的权重，反应了一个事务修改和锁住的行数。在InnoDB中，当发生死锁需要回滚时，```InnoDB```会选择最小的进行回滚。
+* ```trx_mysql_thread_id``` ：```Mysql```中的线程```ID```。
+* ```trx_query```：事务运行的```SQL```语句。
 
+ 例子如下：
+
+```sql
+--1. 先执行获取锁的sql，并且没有释放。注：第一天sql要在Command line控制台执行，在其他工具中执行可能会自动释放锁，导致无法复现。
+begin;select * from person where id = 1 for update;
+--2. 另开事务获取锁
+begin;
+select * from person where id <=2 for update;
 ```
-mysql> select * from INNODB_TRX\G;
+
+执行结果如下：事务```id```为```2432```的```sql```处于```LOCK WAIT```状态，显然是因为第一条```sql```获取行 ```id=1```的锁后没有释放，导致第二条```sql```一直处于等待锁阶段。
+
+```sql
+mysql> select * from INFORMATION_SCHEMA.INNODB_TRX\G;
 *************************** 1. row ***************************
-                    trx_id: 11833
+                    trx_id: 2432
                  trx_state: LOCK WAIT
-               trx_started: 2019-02-21 22:51:36
-     trx_requested_lock_id: 11833:83:3:6
-          trx_wait_started: 2019-02-21 22:51:36
+               trx_started: 2021-03-02 21:48:19
+     trx_requested_lock_id: 2370228135712:35:4:2:2370191953288
+          trx_wait_started: 2021-03-02 21:48:19
                 trx_weight: 2
-       trx_mysql_thread_id: 367
-                 trx_query: select * from user where id = 8 lock in share mode
-     
-*************************** 2. row ***************************
-                    trx_id: 11832
-                 trx_state: RUNNING
-               trx_started: 2019-02-21 22:51:34
-     trx_requested_lock_id: NULL
-          trx_wait_started: NULL
-                trx_weight: 3
-       trx_mysql_thread_id: 366
-                 trx_query: NULL
-       trx_operation_state: NULL
-        
+       trx_mysql_thread_id: 3488
+                 trx_query: select * from person where id <=2
+LIMIT 0, 1000
+for update
 ```
 
-可以看到，事务11833目前处于"LOCK WAIT"状态，运行的sql语句是select * from user where id = 8 lock in share mode。
 
-2）INNODB_LOCKS表
 
-* lock_id：锁的ID。
-* lock_trx_id：事务ID。
-* lock_mode：锁的模式
-* lock_type：锁的类型，表锁还是行锁。
-* lock_table：要加锁的表。
-* lock_index：锁的索引 。
-* lock_space：InnoDB存储引擎表空间ID 号。
-* lock_page：被锁住的页的数量，若是表锁，则该值为NULL。
-* lock_rec：被锁住的行的数量，若是表锁，则该值为NULL。
-* lock_data：被锁住的行的主键值，若是表锁，该值为NULL。
+2）```data_locks```(老版本-```INNODB_LOCKS```)表：锁的情况。
+
+* ```engine_lock_id```：锁的```ID```。
+* ```engine_transaction_id```：事务```ID```。
+* ```lock_mode```：锁的模式。如：```X、IX```。
+* ```lock_type```：锁的类型，表锁(```table```)还是行锁(```record```)。
+* ```object_name```：要加锁的表。
+* ```INDEX_NAME```：锁对应的索引名称 。
+* ```lock_status```：锁状态。```GRANTED、WAITING```
+* ```lock_data```：被锁住的行的主键值，若是表锁，该值为```NULL```。这个值并非是可信的，例如我们执行一个范围查找时，```lock_data```可能返回第一行的主见值。
 
 如下例子：
 
+```sql
+--1. 先执行获取锁的sql，并且没有释放。
+begin;select * from person where id = 1 for update;
+--2. 另开事务获取锁
+begin;
+select * from person where id <=2 for update;
 ```
-mysql> select * from INNODB_LOCKS\G;
+
+执行结果如下：第二条```sql```事务一直处于```LOCK WAIT```状态，在表```data_locks```中，可以看到第二条```sql```申请了两个锁，即I```XY```意向锁和处于```WAITING```的行锁```X```。
+
+```sql
+-- 查询数据库中的事务
+mysql> select * from INFORMATION_SCHEMA.INNODB_TRX\G;
 *************************** 1. row ***************************
-    lock_id: 11836:83:3:6
-lock_trx_id: 11836
-  lock_mode: S
-  lock_type: RECORD
- lock_table: `test`.`user`
- lock_index: GEN_CLUST_INDEX
- lock_space: 83
-  lock_page: 3
-   lock_rec: 6
-  lock_data: 0x000000000203
+                    trx_id: 2441
+                 trx_state: LOCK WAIT
+               trx_started: 2021-03-02 23:58:51
+     trx_requested_lock_id: 2370228134048:35:4:2:2370191943336
+          trx_wait_started: 2021-03-02 23:58:51
+                trx_weight: 2
+       trx_mysql_thread_id: 3494
+                 trx_query: select * from person where id <=2
+LIMIT 0, 1000 for update
+
+-- 查询锁情况
+mysql> select * from performance_schema.data_locks\G;
+*************************** 1. row ***************************
+               ENGINE: INNODB
+       ENGINE_LOCK_ID: 2370228134048:1094:2370191946120
+ENGINE_TRANSACTION_ID: 2441
+            THREAD_ID: 3534
+             EVENT_ID: 17
+        OBJECT_SCHEMA: test_db
+          OBJECT_NAME: person
+       PARTITION_NAME: NULL
+    SUBPARTITION_NAME: NULL
+           INDEX_NAME: NULL
+OBJECT_INSTANCE_BEGIN: 2370191946120
+            LOCK_TYPE: TABLE
+            LOCK_MODE: IX
+          LOCK_STATUS: GRANTED
+            LOCK_DATA: NULL
 *************************** 2. row ***************************
-    lock_id: 11835:83:3:6
-lock_trx_id: 11835
-  lock_mode: X
-  lock_type: RECORD
- lock_table: `test`.`user`
- lock_index: GEN_CLUST_INDEX
- lock_space: 83
-  lock_page: 3
-   lock_rec: 6
-  lock_data: 0x000000000203
+               ENGINE: INNODB
+       ENGINE_LOCK_ID: 2370228134048:35:4:2:2370191943336
+ENGINE_TRANSACTION_ID: 2441
+            THREAD_ID: 3534
+             EVENT_ID: 17
+        OBJECT_SCHEMA: test_db
+          OBJECT_NAME: person
+       PARTITION_NAME: NULL
+    SUBPARTITION_NAME: NULL
+           INDEX_NAME: GEN_CLUST_INDEX
+OBJECT_INSTANCE_BEGIN: 2370191943336
+            LOCK_TYPE: RECORD
+            LOCK_MODE: X
+          LOCK_STATUS: WAITING
+            LOCK_DATA: 0x000000000206
+
 ```
 
-从上可以看到 id为11815的事务向表11836加了一个s的行锁，ID为11835的事务向表user申请一个X的行锁。lock_data都是0x000000000203,申请相同的资源，因此会有等待。
 
-需要注意，lock_data这个值并非是可信的，例如我们执行一个范围查找时，lock_data可能返回第一行的主见值。
 
 3）INNODB_LOCK_WAITS
 
