@@ -46,6 +46,7 @@
 --insert into person(id,username,birthday) values (1,'yss','2020-01-13');
 
 --set @@autocommit=0; 关闭自动提交事务
+---show variables like 'autocommit'; 
 
 --使用consule来执行手动启动事务
 --session A
@@ -181,21 +182,155 @@ OBJECT_INSTANCE_BEGIN: 2370191943336
 
 
 
-3）INNODB_LOCK_WAITS
+3）```data_lock_waits```(老版本-```INNODB_LOCK_WAITS```)
 
-* requesting_trx_id：申请资源的事务ID。
-* requesting_lock_id：申请的事务ID .
-* blocking_trx_id：阻塞的事务ID 。
-* blocking_trx_id：阻塞的锁的 ID。
+* ```REQUESTING_ENGINE_TRANSACTION_ID```：申请资源的事务```ID```。
+* ```REQUESTING_ENGINE_LOCK_ID```：申请锁```ID```。
+* ```BLOCKING_ENGINE_TRANSACTION_ID```：阻塞的事务```ID``` 。
+* ```BLOCKING_ENGINE_LOCK_ID```：阻塞的锁的 ```ID```。
 
+如下例子：
+
+```sql
+--1. 先执行获取锁的sql，并且没有释放。
+begin;select * from person where id = 1 for update;
+--2. 另开事务获取锁
+begin;
+select * from person where id <=2 for update;
 ```
-mysql> select * from INNODB_LOCK_WAITS\G;
+
+执行结果：
+
+```sql
+--查询锁等待记录   事务2450请求资源，但是被2449阻塞。
+mysql> select * from performance_schema.data_lock_waits\G;
 *************************** 1. row ***************************
-requesting_trx_id: 11839
-requested_lock_id: 11839:83:3:6
-  blocking_trx_id: 11838
- blocking_lock_id: 11838:83:3:6
+                          ENGINE: INNODB
+       REQUESTING_ENGINE_LOCK_ID: 2370228135712:35:4:2:2370191953288
+REQUESTING_ENGINE_TRANSACTION_ID: 2450
+            REQUESTING_THREAD_ID: 3536
+             REQUESTING_EVENT_ID: 163
+REQUESTING_OBJECT_INSTANCE_BEGIN: 2370191953288
+         BLOCKING_ENGINE_LOCK_ID: 2370228134048:35:4:2:2370191943336
+  BLOCKING_ENGINE_TRANSACTION_ID: 2449
+              BLOCKING_THREAD_ID: 3538
+               BLOCKING_EVENT_ID: 4
+  BLOCKING_OBJECT_INSTANCE_BEGIN: 2370191943336
+  
+
+
+-- 查询正在运行的事务 
+  mysql> select * from INFORMATION_SCHEMA.INNODB_TRX\G
+*************************** 1. row ***************************
+                    trx_id: 2450
+                 trx_state: LOCK WAIT
+               trx_started: 2021-03-03 22:20:25
+     trx_requested_lock_id: 2370228135712:35:4:2:2370191953288
+          trx_wait_started: 2021-03-03 22:20:25
+                trx_weight: 2
+       trx_mysql_thread_id: 3496
+                 trx_query: select * from person where id <=2
+LIMIT 0, 1000
+for update
+      
+*************************** 2. row ***************************
+                    trx_id: 2449
+                 trx_state: RUNNING
+               trx_started: 2021-03-03 22:20:22
+     trx_requested_lock_id: NULL
+          trx_wait_started: NULL
+                trx_weight: 2
+       trx_mysql_thread_id: 3498
+                 trx_query: NULL
+       trx_operation_state: NULL
+       
+ --- 查询数据库锁情况
+ mysql> select * from performance_schema.data_locks\G;
+*************************** 1. row ***************************
+               ENGINE: INNODB
+       ENGINE_LOCK_ID: 2370228135712:1094:2370191956072
+ENGINE_TRANSACTION_ID: 2450
+            THREAD_ID: 3536
+             EVENT_ID: 163
+        OBJECT_SCHEMA: test_db
+          OBJECT_NAME: person
+       PARTITION_NAME: NULL
+    SUBPARTITION_NAME: NULL
+           INDEX_NAME: NULL
+OBJECT_INSTANCE_BEGIN: 2370191956072
+            LOCK_TYPE: TABLE
+            LOCK_MODE: IX
+          LOCK_STATUS: GRANTED
+            LOCK_DATA: NULL
+*************************** 2. row ***************************
+               ENGINE: INNODB
+       ENGINE_LOCK_ID: 2370228135712:35:4:2:2370191953288
+ENGINE_TRANSACTION_ID: 2450
+            THREAD_ID: 3536
+             EVENT_ID: 163
+        OBJECT_SCHEMA: test_db
+          OBJECT_NAME: person
+       PARTITION_NAME: NULL
+    SUBPARTITION_NAME: NULL
+           INDEX_NAME: GEN_CLUST_INDEX
+OBJECT_INSTANCE_BEGIN: 2370191953288
+            LOCK_TYPE: RECORD
+            LOCK_MODE: X
+          LOCK_STATUS: WAITING
+            LOCK_DATA: 0x000000000206
+*************************** 3. row ***************************
+               ENGINE: INNODB
+       ENGINE_LOCK_ID: 2370228134048:1094:2370191946120
+ENGINE_TRANSACTION_ID: 2449
+            THREAD_ID: 3538
+             EVENT_ID: 4
+        OBJECT_SCHEMA: test_db
+          OBJECT_NAME: person
+       PARTITION_NAME: NULL
+    SUBPARTITION_NAME: NULL
+           INDEX_NAME: NULL
+OBJECT_INSTANCE_BEGIN: 2370191946120
+            LOCK_TYPE: TABLE
+            LOCK_MODE: IX
+          LOCK_STATUS: GRANTED
+            LOCK_DATA: NULL
+*************************** 4. row ***************************
+               ENGINE: INNODB
+       ENGINE_LOCK_ID: 2370228134048:35:4:1:2370191943336
+ENGINE_TRANSACTION_ID: 2449
+            THREAD_ID: 3538
+             EVENT_ID: 4
+        OBJECT_SCHEMA: test_db
+          OBJECT_NAME: person
+       PARTITION_NAME: NULL
+    SUBPARTITION_NAME: NULL
+           INDEX_NAME: GEN_CLUST_INDEX
+OBJECT_INSTANCE_BEGIN: 2370191943336
+            LOCK_TYPE: RECORD
+            LOCK_MODE: X
+          LOCK_STATUS: GRANTED
+            LOCK_DATA: supremum pseudo-record
+*************************** 5. row ***************************
+               ENGINE: INNODB
+       ENGINE_LOCK_ID: 2370228134048:35:4:2:2370191943336
+ENGINE_TRANSACTION_ID: 2449
+            THREAD_ID: 3538
+             EVENT_ID: 4
+        OBJECT_SCHEMA: test_db
+          OBJECT_NAME: person
+       PARTITION_NAME: NULL
+    SUBPARTITION_NAME: NULL
+           INDEX_NAME: GEN_CLUST_INDEX
+OBJECT_INSTANCE_BEGIN: 2370191943336
+            LOCK_TYPE: RECORD
+            LOCK_MODE: X
+          LOCK_STATUS: GRANTED
+            LOCK_DATA: 0x000000000206
+       
+       
 ```
+
+
 
 #### 一致性的非锁定操作
 
