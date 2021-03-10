@@ -4,19 +4,21 @@
 
 ### 获取token
 
-1. 认证流程
+获取token的流程分为两个大步骤：
+
+1. 认证。在basic模式下，BasicAuthenticationFilter过滤器对请求进行拦截，并进行一系列的登录认证。
 
 ![](../../images/security/3.png)
 
-2. 获取token流程。
+2. 获取token流程。过滤器链调用完之后，请求进入/oauth/token接口获取或者创建token。
 
-
+![](../../images/security/4.png)
 
 #### 1. BasicAuthenticationFilter。
 
 > Http Basic模式，请求头中Authorization=Basic xxxxxx
 
-1. 调用BasicAuthenticationConverter的convert方法获取请求头Authorization头。它是ClientId和secret BASE64后的字符串。
+1. 调用BasicAuthenticationConverter的convert方法获取请求头Authorization头。它 是ClientId和secret BASE64后的字符串。
 2. 调用ProviderManager的authenticate方法进行认证。
 
 ```java
@@ -115,13 +117,12 @@ additionalAuthenticationChecks(user,
 
 #### 4.FilterSecurityInterceptor。 
 
-过滤器链中最后一个过滤器，主要是用来进行权限校验。判断用户访问的路径是否有权限。
+过滤器链中最后一个过滤器，主要是用来进行权限校验。判断用户访问的路径是否有权限。经过这个过滤器后，请求正式进入请求方法。
 
 
 
-#### 5. 访问/oauth/token接口。
+#### 5. 访问TokenEndpoint的/oauth/token接口
 
-1. 调用TokenEndpoint中postAccessToken方法。
 2. 在postAccessToken方法中会调用CompositeTokenGranter.grant方法。
 
 ```java
@@ -131,10 +132,12 @@ OAuth2AccessToken token = getTokenGranter().grant(tokenRequest.getGrantType(), t
 		}
 ```
 
-2. CompositeTokenGranter.grant逻辑。
+#### 6. CompositeTokenGranter。
+
+循环tokenGranters集合，调用grant方法。
 
 ```java
-//for循环中调用AbstractTokenGranter的grant方法。
+
 public OAuth2AccessToken grant(String grantType, TokenRequest tokenRequest) {
 		for (TokenGranter granter : tokenGranters) {
 			OAuth2AccessToken grant = granter.grant(grantType, tokenRequest);
@@ -146,7 +149,7 @@ public OAuth2AccessToken grant(String grantType, TokenRequest tokenRequest) {
 	}
 ```
 
-3. AbstractTokenGranter逻辑
+#### 7. AbstractTokenGranter
 
 ```java
 if (!this.grantType.equals(grantType)) {
@@ -162,15 +165,17 @@ return getAccessToken(client, tokenRequest);
 
 ```
 
-* getAccessToken方法，调用createAccessToken方法创建token，并返回token。
+* getAccessToken方法，先调用getOAuth2Authentication方法，验证用户信息，在调用createAccessToken方法创建token，并返回token。
 
-```
+```java
 protected OAuth2AccessToken getAccessToken(ClientDetails client, TokenRequest tokenRequest) {
    return tokenServices.createAccessToken(getOAuth2Authentication(client, tokenRequest));
 }
 ```
 
-* getOAuth2Authentication方法。调用子类ResourceOwnerPasswordTokenGranter的实现。在此方法中最再次调用ProviderManager的authenticate方法来进行登录认证。与前面调用区别是username和password是用户的实际账号、密码。
+#### 8. ResourceOwnerPasswordTokenGranter
+
+调用ProviderManager的authenticate方法来进行登录认证，username和password是用户的实际账号、密码，不是clientid。
 
 ```java
 Map<String, String> parameters = new LinkedHashMap<String, String>(tokenRequest.getRequestParameters());
@@ -195,55 +200,55 @@ Map<String, String> parameters = new LinkedHashMap<String, String>(tokenRequest.
 
 
 
-### 用户请求调用链
 
-时序图略。
 
-#### 1. OAuth2AuthenticationProcessingFilter
+### 用户请求调用链路
+
+![](../../images/security/5.png)
+
+1. OAuth2AuthenticationProcessingFilter拦截用户请求
 
 ```java
 public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain) throws IOException,
 			ServletException {
     //获取前端传送的token
-	Authentication authentication = 	tokenExtractor.extract(request);
+	Authentication authentication = tokenExtractor.extract(request);
     //登录认证
     Authentication authResult = authenticationManager.authenticate(authentication);
 }
 ```
 
-1. 获取用户请求token。
+2. 获取用户请求token。
 
-   ```java
-   protected String extractHeaderToken(HttpServletRequest request) {
-   //获取请求头中的Authorization
-   		Enumeration<String> headers = request.getHeaders("Authorization");
-       
-   		while (headers.hasMoreElements()) { 
-   			String value = headers.nextElement();
-      //获取value以bearer开头的值         
-   			if ((value.toLowerCase().startsWith(OAuth2AccessToken.BEARER_TYPE.toLowerCase()))) {
-      //获取token             
-   				String authHeaderValue = value.substring(OAuth2AccessToken.BEARER_TYPE.length()).trim();
-   				
-   				request.setAttribute(OAuth2AuthenticationDetails.ACCESS_TOKEN_TYPE,
-   						value.substring(0, OAuth2AccessToken.BEARER_TYPE.length()).trim());
-   				int commaIndex = authHeaderValue.indexOf(',');
-   				if (commaIndex > 0) {
-   					authHeaderValue = authHeaderValue.substring(0, commaIndex);
-   				}
-   				return authHeaderValue;
-   			}
-   		}
+```java
+protected String extractHeaderToken(HttpServletRequest request) {
+//获取请求头中的Authorization
+		Enumeration<String> headers = request.getHeaders("Authorization");
+    
+		while (headers.hasMoreElements()) { 
+			String value = headers.nextElement();
+   //获取value以bearer开头的值         
+			if ((value.toLowerCase().startsWith(OAuth2AccessToken.BEARER_TYPE.toLowerCase()))) {
+   //获取token             
+				String authHeaderValue = value.substring(OAuth2AccessToken.BEARER_TYPE.length()).trim();
+				
+				request.setAttribute(OAuth2AuthenticationDetails.ACCESS_TOKEN_TYPE,
+						value.substring(0, OAuth2AccessToken.BEARER_TYPE.length()).trim());
+				int commaIndex = authHeaderValue.indexOf(',');
+				if (commaIndex > 0) {
+					authHeaderValue = authHeaderValue.substring(0, commaIndex);
+				}
+				return authHeaderValue;
+			}
+		}
 
-   		return null;
-   	}
-   ```
+		return null;
+	}
+```
 
-   ​
+3. 调用OAuth2AuthenticationManager.authenticate获取token，验证token的有效性。
 
-2. 调用ProviderManager.authenticate方法，进行登录认证。
-
-3. 调用最后一个权限过滤器。
+4. 调用FilterSecurityInterceptor过滤器,，进行权限校验。
 
 
 
