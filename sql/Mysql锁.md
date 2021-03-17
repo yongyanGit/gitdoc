@@ -1,11 +1,14 @@
 ### Mysql 锁（InnoDB引擎）
 
-#### 锁的类型
+#### 锁的分类
+
+* 基于锁的属性分类：共享锁、排他锁、意向共享锁、意向排他锁、自增锁。
+* 基于锁的粒度分类：表锁、行锁。
+
+#### 锁的属性
 
 * 共享锁(S Lock)：允许事务读一行数据。
 * 排他锁(X Lock)：允许事务删除或者更新一行数据。
-
-如：事务```T1```获取了行```r```的共享锁，事务```T2```也可以获取行```r```的共享锁。事务```T3```想获取行```r```的互斥锁，则需要等待```T1、T2```释放共享锁。
 
 共享锁与互斥锁的兼容关系如下：
 
@@ -13,6 +16,8 @@
 | ---- | ---- | ---- |
 | x    | 冲突 | 冲突 |
 | s    | 冲突 | 兼容 |
+
+如：事务```T1```获取了行```r```的共享锁，事务```T2```也可以获取行```r```的共享锁。事务```T3```想获取行```r```的互斥锁，则需要等待```T1、T2```释放共享锁。
 
 共享锁、排他锁可以解决行级别的数据并发修改问题，但是在某些情况下，直接使用行级别的锁来判断是否可以对数据进行修改，效率不高。如：事务```T1```对表```t1```行```r```加了独占锁，事务```T2```将要对表```t1```加**表级别的共享锁**，那么它需要进行全表扫描来确定是否存在独占锁，如果一个表数据量比较大，那么它的效率就不会很高。所以```InnoDB```引入了意向锁来解决这个问题。
 
@@ -60,7 +65,181 @@ lock table person write; --session A释放锁之前，SessionB会一直阻塞
 
 如上```session A``` 需要获取```a=1```行的```X```锁，并且```session A```在获取行锁前，它必须获取```t```表的```IX```锁，行锁与意向锁不冲突，可以兼容。```session B```获取```t```的全表```x```锁，但是```session B```发现```t```表已经被设置了```IX```锁，```session B```被阻塞。
 
-#### 锁监控
+* 自增锁
+
+```AUTOINC```锁又叫自增锁，是一种表锁。当表中有自增列(```AUTOINCREMENT```)时出现。当插入表中有自增列时，数据库需要自动生成自增值，它会为该表加```AUTOINC```表锁，阻止其他事务的插入操作，这样保证生成的自增值是唯一的。
+
+```AUTOINC```锁互不兼容，也就是同一张表同时只允许有一个自增锁。自增值一旦分配了就会+1，如果事务回滚，自增值也不会减回去，所以自增值可能会出现中断的情况。
+
+#### 按照粒度锁分类
+
+* 表锁
+
+  表锁是指对一整张表加锁，一般是```DDL```处理时使用，如ALTER TABLE等操作；也可以明确对某个表进行加锁。表锁由```MySQL Server```实现。
+
+  ```SQL
+  LOCK TABLE t WRITE(READ);
+  ```
+
+* 行锁
+
+  行锁是指上锁的时候锁住表某一行或多行。
+
+  ```InnoDB ```是聚簇索引，也就是 B+树的叶节点既存储了主键索引也存储了数据行。而 ```InnoDB ```的二级索引的叶节点存储的则是主键值，所以通过二级索引查询数据时，还需要拿对应的主键去聚簇索引中再次进行查询。
+
+  ```sql
+  --id primary key
+  update user set age = 10 where id = 49;
+  ```
+
+  如上sql通过主键索引来查询，则只需要在id=49的聚簇索引上加写锁。
+
+  ```sql
+  --name key
+  update user set age = 10 where name = 'Tom';
+  ```
+
+  如上sql使用二级索引来查询，首先在name = tom的二级索引上加锁，然后根据主键去检索聚簇索引在相应的主键索引上加锁。
+
+  
+
+#### 锁的算法
+
+InnoDB存储引擎中有3种行锁的算法设计，分别是：
+
+* Record Lock ：记录锁，单行记录上的锁。
+
+  ```sql
+  --记录锁，只锁住a=3的这一条数据。
+  select * from t where a = 3 for update;//a 是表t的主键
+  ```
+
+  当```sql```无法使用索引时，会进行全表扫描，这个时候```Mysql```会给整张表的所有数据加记录锁，再由```Mysql Server```层进行过滤，释放掉不符合```where```条件的记录锁。
+
+  所以更新操作必须根据索引进行操作，没有索引会消耗大量的锁资源。
+
+* Gap Lock：间隙锁，锁定一个范围，但不包括记录本身。
+
+  间隙锁是一种加在两个索引之间的锁，或者加在第一个索引之前或最后一个索引之后的间隙。使用间隙锁可以防止其他事务在当前事务范围内插入或者修改数据，保证两次读取这个范围内的记录不会变，从而不会出现幻读现象。
+
+* Next-Key Lock :Gap Lock+Record Lock，锁定一个范围，并且锁定记录本身。
+
+  记录锁和间隙锁的组合。它指的是加在某条记录以及这条记录前面间隙的锁。
+
+#### 常见加锁场景分析
+
+1. id主键+RC
+
+   ```sql
+   --id是主键，Read Commit隔离级别。
+   delete from t1 where id = 10
+   ```
+
+   ![](../images/sql/7.jpg)
+
+   结论：id是主键，只需要在id=10的这条记录上加X锁即可。
+
+2. id唯一索引+RC
+
+   ```sql
+   --id是唯一索引，Read Commit隔离级别。
+   delete from t1 where id = 10
+   ```
+
+   ![](../images/sql/8.jpg)
+
+   id是唯一索引，在找到id=10的记录后，首先会将unique索引上的id=10索引加上X锁，同时会根据读取到的name列，会主键索引，然后将主键索引上name=d对应的主键索引加X锁。
+
+   在主键索引上加锁的原因是，如果这个时候有一条delete语句将要把name=d的数据删掉，由于主键索引没有加锁，delete语句可以成功获取锁并把数据删除掉，而并发的update此时感知不到数据已经被删除掉了，违背了独占锁互斥的原则。
+
+3. id非唯一索引+RC
+
+   ```sql
+   --id key
+   delete from t1 where id = 10; 
+   ```
+
+   ![](../images/sql/9.jpg)
+
+   id索引上，满足id=10查询条件记录都已经加锁。同时这些记录对应的主键索引上的记录也都加上了锁。
+
+   结论：如果id列上有非唯一索引，那么对应的所有满足sql查询条件的记录都会被加锁。同时这些记录的主键索引上的记录也会被加锁。
+
+4. id无索引+RC
+
+   id列上没有索引，where id = 10这个过滤条件没法通过索引进行过滤，那么只能走全表扫描做过滤。
+
+   ![](../images/sql/10.jpg)
+
+   结论：如果id上没有索引，sql会走聚簇索引的全表扫描进行过滤，由于过滤是由MYSQL Server层面进行的，因此每条记录，无论是否满足条件，都会被加上X锁。但是为了效率考虑，MYSQL 做了优化，对于不满足条件的记录，会在判断后释放锁，最终持有的是满足条件的记录上的锁。
+
+5. id主键+RR
+
+   与【id主键，Read Committed】一致。
+
+6. id唯一索引+RR
+
+   与【id唯一索引，Read Committed】一致。
+
+7. id非唯一索引+RR
+
+   ```sql
+   delete from t1 where id = 10;
+   ```
+
+   ![](../images/sql/11.jpg)
+
+   与【id列上非唯一锁，Read Committed】的最大区别是多了一个GAP锁，而且GAP锁看起来不是加在记录上，而是加在两条记录之间。
+
+   GAP锁就是RR级别相对于RC隔离级别不会出现幻读的关键。所谓幻读是同一个事务连续做两次**当前读**，那么这两次当前读返回的是完全相同的记录，第二次当前读不会比第一次返回更多的记录(幻读)
+
+   考虑到B+树的有序性，满足条件的项一定是连续存放的。[6,c]之前，[11,f]之后不会插入id=10的记录；[6,c]和[10,b]之间可以插入[10,aa]；[10,b]和[10,d]之间可以插入[10,c]；[10,d]和[11,f]之间可以插入[10,e]。因此为了保证[6,c]和[10,b]，[10,b]和[10,d]，[10,d]和[11,f]之间不会插入新的记录，MYSQL选择了GAP锁，将这三个GAP给锁起来了。
+
+   前面的5、6案例中没有GAP锁是因为主键索引和唯一索引都是等值查询，只会返回一条数据，而且是新的相同取值的记录，一定不会有新插入进来的记录，因此避免了GAP锁的使用。
+
+   结论：Repeatable Read隔离级别下，id列上有一个非唯一索引。 首先，通过id索引定位到第一条满足查询条件的记录，加记录上的X锁，加GAP上的GAP锁，然后加主键聚簇索引上的记录X锁，然后返回；然后读取下一条，重复进行。直至进行到第一条不满足条件的记录[11,f]，此时，不需要加记录X锁，但是仍旧需要加GAP锁，最后返回结束
+
+8. id无索引+RR
+
+   ![](../images/sql/12.jpg)
+
+结论：在Repeatable Read隔离级别下，如果进行全表扫描的当前读，那么会锁上表中的所有记录，同时会锁上聚簇索引内的所有GAP，杜绝所有的并发 更新/删除/插入 操作。当然，也可以通过触发semi-consistent  read，对于不满足查询条件的记录，MySQL会提前放锁，来缓解加锁开销与并发影响，但是semi-consistent read本身也会带来其他问题，不建议使用。
+
+9. serializable
+
+   Serializable隔离级别，读不加锁就不再成立，所有的读操作，都是当前读。
+
+#### 一条复杂的SQL
+
+![](../images/sql/14.jpg)
+
+* Index key：pubtime > 1 and puptime < 20。此条件，用于确定SQL在idx_t1_pu索引上的查询范围。
+
+* Index Filter：userid = ‘hdc’ 。此条件，可以在idx_t1_pu索引上进行过滤，但不属于Index Key。
+
+* Table Filter：comment is not NULL。此条件，在idx_t1_pu索引上无法过滤，只能在聚簇索引上
+
+在分析出SQL where条件的构成之后，再来看看这条SQL的加锁情况 (RR隔离级别)，如下图所示:
+
+![](../images/sql/15.jpg)
+
+从图中可以看出，在Repeatable Read隔离级别下，由Index Key所确定的范围，被加上了GAP锁；Index  Filter锁给定的条件 (userid = ‘hdc’)何时过滤，视MySQL的版本而定，在MySQL 5.6版本之前，不支持Index  Condition Pushdown(ICP)，因此Index Filter在MySQL Server层过滤，在5.6后支持了Index  Condition Pushdown，则在index上过滤。若不支持ICP，不满足Index  Filter的记录，也需要加上记录X锁，若支持ICP，则不满足Index Filter的记录，无需加记录X锁  (图中，用红色箭头标出的X锁，是否要加，视是否支持ICP而定)；而Table Filter对应的过滤条件，则在聚簇索引中读取后，在MySQL  Server层面过滤，因此聚簇索引上也需要X锁。最后，选取出了一条满足条件的记录[8,hdc,d,5,good]，但是加锁的数量，要远远大于满足条件的记录数量。
+
+结论：在Repeatable Read隔离级别下，针对一个复杂的SQL，首先需要提取其where条件。Index  Key确定的范围，需要加上GAP锁；Index Filter过滤条件，视MySQL版本是否支持ICP，若支持ICP，则不满足Index  Filter的记录，不加X锁，否则需要X锁；Table Filter过滤条件，无论是否满足，都需要加X锁。
+
+#### 死锁原理与分析
+
+![](../images/sql/16.jpg)
+
+![](../images/sql/17.jpg)
+
+上面的两个死锁用例。第一个非常好理解，也是最常见的死锁，每个事务执行两条SQL，分别持有了一把锁，然后加另一把锁，产生死锁。
+
+第二个用例，虽然每个Session都只有一条语句，仍旧会产生死锁。要分析这个死锁，首先必须用到本文前面提到的MySQL加锁的规则。针对Session 1，从name索引出发，读到的[hdc, 1]，[hdc,  6]均满足条件，不仅会加name索引上的记录X锁，而且会加聚簇索引上的记录X锁，加锁顺序为先[1,hdc,100]，后[6,hdc,10]。而Session  2，从pubtime索引出发，[10,6],[100,1]均满足过滤条件，同样也会加聚簇索引上的记录X锁，加锁顺序为[6,hdc,10]，后[1,hdc,100]。发现没有，跟Session 1的加锁顺序正好相反，如果两个Session恰好都持有了第一把锁，请求加第二把锁，死锁就发生了。
+
+结论：死锁的发生与否，并不在于事务中有多少条SQL语句，死锁的关键在于：两个(或以上)的Session加锁的顺序不一致。而使用本文上面提到的，分析MySQL每条SQL语句的加锁规则，分析出每条语句的加锁顺序，然后检查多个并发SQL间是否存在以相反的顺序加锁的情况，就可以分析出各种潜在的死锁情况，也可以分析出线上死锁发生的原因。
+
+#### InnoDB记录锁信息表
 
 > show engine innodb status。查看当前锁请求信息。
 
@@ -329,339 +508,3 @@ OBJECT_INSTANCE_BEGIN: 2370191943336
        
        
 ```
-
-
-
-#### 多版本控制(Multi Version Concurrency Control,MVCC)
-
-
-
-
-
-
-
-#### 一致性的非锁定操作
-
-一致性的非锁定是指InnoDB存储通过行多版本控制的方式来读取当前执行时间数据库中行的数据。如果读取的行正在执行DELETE、UPDATE操作，这时读取操作不会因此而等待行上锁的释放，相反、InnoDB存储引擎会去读取行的快照数据。
-
-![](../images/mysql/kuaizhao.png)
-
- 快照数据是指该行之前版本的数据，该实现是通过Undo段来实现。Undo用来在事务中回滚数据，因此快照数据本身是没有额外的开销。
-
-在InnoDB存储默认设置下，这是默认的读取方式，即读取不会占用和等待表上的锁。但是在不同事务隔离级别下，读取的方式不同，并不是每个事务隔离级别下读取的都是一致性。
-
-在Read Committed和Repeatable Read（InnoDB 存储引擎的默认事务隔离级别）下，InnoDB存储引擎使用非锁定的一致性读。但是对于快照数据的定义却不相同。在Read Committed事务隔离级别下，对于快照数据，非一致性读总是读取被锁定行的最新一份快照数据。在Repeatable Read事务隔离级别下，对于快照数据，非一致性读总是读取事务开始时的行数据版本。
-
-如下例子：
-
-默认情况下，mysql的隔离级别是REPEATABLE-READ 
-
-```
-mysql> select @@tx_isolation;
-+-----------------+
-| @@tx_isolation  |
-+-----------------+
-| REPEATABLE-READ |
-+-----------------+
-```
-
-```
-# Session A
-mysql> begin;
-mysql> select * from user where id = 8;
-+------+------+------+------+
-| id   | name | age  | sex  |
-+------+------+------+------+
-|    8 | yan7 |   20 | NULL |
-+------+------+------+------+
-```
-
-如上会话A中，开启事务(begin)，然后读取了id = 8的数据，但是没有执行提交事务。这时我们再开启另一个会话：
-
-```
-＃ Session B
-mysql> begin;
-update user set id = 1 where id = 8;
-```
-
-同样会话B中将id 改成1后并没有提交事务，这样id=8的行加了一个X锁，这时如果再在会话A中查询id=8的数据时，上述两种隔离仍然可以查询到数据
-
-```
-ysql> select * from user where id = 8;
-+------+------+------+------+
-| id   | name | age  | sex  |
-+------+------+------+------+
-|    8 | yan7 |   20 | NULL |
-+------+------+------+------+
-```
-
-接着我们提交会话B的事务，这时两种隔离级别的查询结果就不同了。对于Read Commit 的事务隔离级别，它总是读取行的最新数据，如果该行被加了锁，则读取该版本的最新一个快照。
-
-```
-#设置会话的隔离级别为 read committed
-set session transaction isolation level read committed;
-
-#然后再重新执行上面的流程，发现查询结果为空
-mysql> select * from user where id = 1;
-Empty set (0.00 sec)
-```
-
-对于Repeatable的事务隔离级别，总是读取事务开始时的行数据。
-
-#### SELECT … FOR UPDATE &SELECT …LOCK IN SHARE MODE
-
-* SELECT .. FRO UPDATE 读取的行记录加一个X锁。其它事务想在这些行上加锁都会被阻塞。
-* SELECT …LOCK IN SHARE：对读取的行记录加一个S锁。其它事务可以向锁定的记录加S锁，但是对于加X锁，则会被阻塞。
-
-对于一致性非锁定读，即使读取的行已被使用SELECT …FOR UPDATE,也是可以进行读取的。另外这两个查询语句必须在事务中执行，当事务提交了，锁也就释放连。
-
-
-
-#### 自增长和锁
-
-在InnoDB存储引擎的内存结构中，对每个含有自增长值的表都有一个自增长计数器(auto-increment counter)。当对含有自增长计数器的表进行插入操作时，这个计数器会被初始化，执行如下的语句来得到计数器值：
-
-```
-select max(auto_inc_col) from t for update
-```
-
-插入操作会依据这个自增长的计数器值加1赋予自增长列。这个实现方式称为AUTO-INC Locking。这种锁其实是采用一种特殊的表锁机制，并且为了提高插入的性能，锁不是在一个事务完成后才释放，而是在完成对自增长值插入的SQL语句后立即释放。
-
-对于有自增长值列的并发插入性能比较差，因为必须等待前一个插入的完成（虽然不用等待事务的完成）。
-
-从5.1.22版本开始，InnoDB存储引擎提供了一种轻量级的自增长实现机制，该存储引擎提供了一个参数innodb_autoinc_lock_mode,默认值为1。
-
-* innodb_autoinc_lock_mode=0 即通过表锁的AUTO-INC Locking方式。
-* innodb_autoinc_lock_mode＝1 这是该参数的默认值。对于"Simple insert"(插入前就确定插入行数的语句，如：insert，replace)，该值会用互斥量（mutex）去对内存中的计数器进行累加。对于"Bulk inserts"(插入前不确定插入行数的语句，如：insert ...select,load data)还是使用传统表锁的AUTO-INC Locking方式。并且如果已经使用了AUTO-INC Locing的方式产生增长的值，而这时再进行"Simple inserts"的操作时，还是需要等待AUTO-INC Locking的释放。
-* innodb_autoinc_lock_mode＝2 对于所有的自增长都是通过互斥量(mutex)，而不是AUTO-INC Locking的方式。这是最高性能的方式，但是因为并发插入的存在，自增长的值可能不是连续的。此外基于Statement-Base Replication 会出现问题。
-
-
-
-#### 外键和锁
-
-对于外键列，如果没有显式地对这个列加索引，InnoDB存储引擎自动对其加一个索引，因为这样可以避免表锁。
-
-对于外键值的插入或者更新，首先需要查询父表中的记录，即SELECT 父表。但是对于父表的SELECT操作，不是使用一致性非锁定读方式，因为这样会发生数据不一致的问题。因此这时使用的是SELECT …LOCK IN SHARE MODE方式，主动对父表加一个S锁。如果这时父表上已经加了X锁，那么子表上的操作会被阻塞。
-
-
-
-#### 锁的算法
-
-InnoDB存储引擎中有3种行锁的算法设计，分别是：
-
-* Record Lock ：单行记录上的锁。
-* Gap Lock：间隙锁，锁定一个范围，但不包括记录本身。
-* Next-Key Lock :Gap Lock+Record Lock，锁定一个范围，并且锁定记录本身。
-
-Record Lock总是会去锁住索引记录。如果InnoDB存储引擎表建立的时候没有设置任何一个索引，这时InnoDB 存储引擎会使用隐式的主键来进行锁定。
-
-间隙锁保证某个间隙内的数据在锁定情况下不会发生任何变化，比如mysql默认隔离级别下的可重复读。
-
-当使用唯一索引来搜索唯一行时，不需要间隙锁定，如下：
-
-```sql
-select * from t where a = 3 for update;//a 是表t的主键，不会使用间隙锁
-```
-
-如果上面的a没有建立索引或者非唯一索引，则会产生间隙锁。如下我们创建了一个表：
-
-```sql
-create table g (name varchar(10),i int,primary key(name),index idx_i(i)) engine=InnoDB;
-
-insert into g (name,i) values ('a',5);
-insert into g (name,i) values ('b',8);
-insert into g (name,i) values ('c',10);
-insert into g (name,i) values ('d',10);
-insert into g (name,i) values ('e',11);
-insert into g (name,i) values ('f',15);
-
-# session A
-begin;
-update g set i=i+100 where i = 10;
-
-#session B
-insert into g(name,i) values("z",8);
-```
-
-mysql中的数据是按照 B+树来排列的，所以它是有序的，我们大概列出它的顺序：
-
-```('a',5)、('b',8)、('c',10)、('d',10)、('e',11)、('f',15);```
-
-我们在session A 中执行update方法，由于i是非唯一索引，并且索引在mysql中是有序的，所以它会锁定(8,10)和(10,11)。然后我们在session B中插入("z",8)时，由于和(8,10)重叠了，所以会话B会进入阻塞。
-
-间隙的范围是向下寻找最靠近检索条件的记录值A作为坐区间，向上寻找最靠近检索条件的记录值B作为右区间，即锁定的间隙为(A,B)。
-
-需要注意的是当列上没有索引时，sql会进行全表扫描过滤，因此每条记录都会被加上X锁。但是为了效率考虑，对于不满足条件的记录，会在判断后放锁，最终持有的是满足条件的记录上的锁。
-
-InnoDB对于行的查询都是采用Next-Key Lock这种锁定算法，对于不同的查询语句，可能设置共享和排他的 Next-Key Lock。
-
-如下演示Next-Key Lock的锁定算法：
-
-```
-#创建表
-mysql> create table t(a int,primary key(a))engine=InnoDB;
-#插入1、2、3、4、7、8数据
-mysql> insert into t select 8;
-...
-mysql> select * from t;
-+---+
-| a |
-+---+
-| 1 |
-| 2 |
-| 3 |
-| 4 |
-| 7 |
-| 8 |
-+---+
-
-```
-
-接着开启两个会话，会话A在一个事务中执行如下sql语句：
-
-```
-mysql> begin;
-mysql> select * from t where a < 6 lock in share mode;
-```
-
-执行会话A后没有提交事务，接着开启会话B：
-
-```
-mysql> begin;
-mysql> insert into t select 5;
-```
-
-在会话A中，无论插入5还是6，都会被锁定。因为在Next-Key Lock算法下，锁定的是(-%,6)这个区间的所有数值。但是插入9这个数值是可以的，因为该记录不在锁定的范围内。
-
-Next-Key Lock算法是默认的行记录锁定算法。
-
-#### 锁问题
-
-1. 丢失更新
-
-简单来说出现下面的情况时，就会出现丢失更新：
-
-1）事务T1查询一行数据，放入本地内存，并显示给一个终端用户User1.
-
-2）事务T2也查询这行数据，并将取得的数据显示给终端用户User2。
-
-3）User1修改这行数据，更新数据到数据库。
-
-4）User2修改这行数据，更新数据到数据库。
-
-显然上面过程中User1的修改更新操作“丢失”了。这可能会发生一个恐怖的结果，比如：一个用户账户中有10000元人民币，他用两个网上银行的客户端转账，第一次转9000人民币，因为网络和数据的关系，这时需要等待。但是如果这时用户可以操作另一个网上银行客户端，转账1元。如果最终两笔操作都成功了，用户的账户余额是9999人民币，第一次转的9000人民币没有得到更新。要避免丢失更新，需要将这种情况下的事务变成串行操作，而不是并发的操作。
-
-2. 脏读
-
-脏数据和脏页有所不同。脏页指的是在缓冲池中已经被修改的页，但是还没有刷新到磁盘，即数据库实例内存中的页和磁盘的页中的数据是不一致的，当然在刷新到磁盘之前，日志都已经被写入了重做日志文件中。
-
-而所谓脏数据，是指在缓冲池中被修改的数据，并且还没有被提交。如果读到了脏数据，即一个事务可以读到另一个事务中未提交的数据，则显然违反了数据库的隔离性。
-
-脏读发生的条件是需要事务隔离级别为READ UNCOMMITTED，如下示例：
-
-```
-#session A
-#将会话A的事务隔离级别设置为 read uncommited
-mysql> set session transaction isolation level read uncommitted;
-mysql> select @@tx_isolation;
-+------------------+
-| @@tx_isolation   |
-+------------------+
-| READ-UNCOMMITTED |
-+------------------+
-mysql> begin;
-mysql> select * from t;
-+---+
-| a |
-+---+
-| 1 |
-| 2 |
-| 3 |
-+---+
-
-
-#session B
-mysql> begin;
-mysql> insert into t select 3;
-
-```
-
-如上，session A可以读到session B中未提交的数据，即产生来脏读，违反了事务的隔离性。目前大部分数据库的隔离级别至少设置成READ COMMITTED。InnoDB存储引擎默认的事务隔离级别为READ REPEATABLE。
-
-3. 不可重复读(虚读)
-
-不可重复读是指在一个事务内多次读同一数据，在这个事务还没有结束时，另一个事务也访问同一数据，那么在第一个事务的两次读取数据之间，由于第二个事务的修改，导致第一个事务两次读到的数据可能是不一样的。这样就发生了在一个事务内两次读到的数据是不一样的，因此称为不可重复读。
-
-不可重复读和脏读的区别是：脏读是读到未提交的数据；而不可重复读读到是已经提交的数据。
-
-一般来说，不可重复读的问题是可以接受的，因为其读到的是已经提交的数据，本身并不会带来很大的问题。因此很多数据库厂商(Oracle、SQL Server)将其数据库事务的默认级别设置为READ COMMMITTED，这种隔离级别下允许不可重复读。
-
-在InnoDB存储引擎中，通过使用Next-Key Lock算法来避免不可重复读的问题。在Next-Key Lock 算法下，对于索引的扫描，不仅仅是锁住扫描到的索引，而且还锁住这些索引覆盖的范围。因此对于这个范围内的插入都是不允许的，这样就避免另外的事务在这个范围内插入数据导致的不可重复读的问题。
-
-指事务A读取与搜索条件相匹配的若干行
-
-#### 阻塞
-
-在InnoDB存储引擎的源代码中，用Mutex数据结构来实现锁。在访问资源前需要用mutex_enter函数进行申请，在资源访问或修改完毕后立即执行mutex_exit函数。
-
-当一个资源已被一个事务占用时，另一个事务执行mutex_enter函数会发生等待，这就是阻塞。
-
-在InnoDB存储引擎中，参数innodb_lock_wait_timeout用来控制等待时间（默认是50秒），innodb_rollback_on_timeout用来设定是否等待超时时对进行的事务进行回滚操作（默认是off，代表不回滚）。innodb_lock_wait_timeout可以修改，innodb_rollback_on_timeout是静态的，不可在启动时进行修改。
-
-```
-mysql> select @@innodb_lock_wait_timeout;
-+----------------------------+
-| @@innodb_lock_wait_timeout |
-+----------------------------+
-|                         50 |
-+----------------------------+
-```
-
-但是在实际操作时没有触发行锁，直接表锁，没有测试成功，如下：
-
- ```
-# session A
-mysql> begin;
-mysql> select a from t where a < 4 for update;
-+---+
-| a |
-+---+
-| 1 |
-+---+
-# session B ,直接超时报异常。
-mysql> begin;
-mysql> insert into t select 6;
-ERROR 1205 (HY000): Lock wait timeout exceeded; try restarting transaction
- ```
-
-
-
-#### 死锁
-
-死锁只发生于并非的情况，数据库就是一个并发进行着的程序，因此可能会发生死锁。InnoDB 存储引擎有一个后台的锁监控线程，该线程负责查看可能的死锁问题，并自动告知用户。
-
-```
-#sessionA
-mysql> begin;
-mysql> select * from t where a = 1 for update;
-
-#sessionB
-mysql> begin;
-mysql> select * from t where a = 2 for update;
-
-#session A  进入阻塞
-mysql> select * from t where a = 2 for update;
-
-# session B 抛出死锁异常，然后sessionB就可以查到数据
-mysql> select * from t where a = 1 for update;
-ERROR 1213 (40001): Deadlock found when trying to get lock; try restarting transaction
-
-```
-
-死锁的原因是会话A和 B的资源互相等待。大多数的死锁InnoDB自己可以侦测到，上面的例子，会话B中的事务抛出死锁异常后，会话A中马上得到来记录为2的这个资源，这是因为会话B中的事务发生了回滚。
-
-InnoDB 存储引擎并不会回滚大部分的错误异常，但是死锁除外。发现死锁后，InnoDB 存储引擎会马上会回滚一个事务。
-
-
-
-#### 锁升级
