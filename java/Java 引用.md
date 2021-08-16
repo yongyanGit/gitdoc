@@ -57,7 +57,6 @@ public class SoftReferenceTest {
 
         private String name;
         private Byte[] bytes = new Byte[1024 * 1024];
-
         public Person(String name) {
             this.name = name;
         }

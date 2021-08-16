@@ -10,7 +10,7 @@ ReentrantLock的几个重要方法：
 * tryLock(long time,TimeUnit unit)：在给定的时间内尝试获得锁。
 * unlock()：释放锁。
 
-一个简单的例子（公平锁），：
+一个简单的例子（公平锁）：
 
 ```java
 public class FairLock implements Runnable {

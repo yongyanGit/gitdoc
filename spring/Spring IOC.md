@@ -869,7 +869,7 @@ public Object getSingleton(String beanName, ObjectFactory<?> singletonFactory) {
          catch (IllegalStateException ex) {
             // Has the singleton object implicitly appeared in the meantime ->
             // if yes, proceed with it since the exception indicates that state.
-            singletonObject = this.singletonObjects.get(beanName);
+             singletonObject = this.singletonObjects.get(beanName);
             if (singletonObject == null) {
                throw ex;
             }
@@ -1021,6 +1021,7 @@ protected void addSingletonFactory(String beanName, ObjectFactory<?> singletonFa
 			}
 	}
 }
+
 ```
 
 创建实例：

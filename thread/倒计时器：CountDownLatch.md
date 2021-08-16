@@ -62,7 +62,7 @@ Sync(int count) {
   }
 ```
 
-* await()：主线程进行阻塞状态。
+* await()：主线程进行阻塞状态。 
 
 ```java
  public void await() throws InterruptedException {
