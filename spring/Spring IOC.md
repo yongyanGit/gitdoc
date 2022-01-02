@@ -12,7 +12,7 @@ IOC-Inversion of Control 即控制反转，用户自己不进行对象的创建�
 
 #### Spring IOC 体系结构
 
- Spring Bean的创建是典型的工厂模式，这一系列的Bean工厂，也即IOC容器为开发者管理对象间的依赖关系提供了很多便利和基础服务，在Spring中有许多的IOC容器的实现供用户选择和使用，其相互关系如下：
+ Spring Bean的创建是典型的工厂模式，这一系列的Bean工厂，也即IOC容器为开发者管理对象间的依赖关系提供了很多便利和基础服务， 在Spring中有许多的IOC容器的实现供用户选择和使用，其相互关系如下：
 
 ![](../images/spring/2.png)
 
@@ -25,7 +25,11 @@ IOC-Inversion of Control 即控制反转，用户自己不进行对象的创建�
 
 * ListableBeanFactory：提供接口可以枚举所有的对象而不是根据名称来查询某一个对象。
 
-* HierarchicalBeanFactory ：子对象可以继承一个工厂类，形成父子级联IoC容器的接口。通过setParentBeanFactory方法可以设置父工厂类。
+* HierarchicalBeanFactory ：子对象可以继承一个工厂类，形成父子级联IoC容器的接口。通过setParentBeanFactory方法可
+
+* 
+
+* 以设置父工厂类。
 
   ```java
   //返回父工厂
@@ -269,7 +273,7 @@ protected void processBeanDefinition(Element ele, BeanDefinitionParserDelegate d
 
 ```
 
-到目前步骤已经获取到了定义Bean信息的xml的文档对象，剩下的就是遍历Document节点，将节点信息解析出来：
+遍历Document节点，将节点信息解析出来：
 
 ```java
 //BeanDefinitionParserDelegate
@@ -383,7 +387,7 @@ public static String decapitalize(String name) {
 
 ```
 
-接着上面方法中分parseBeanDefinitionElement来分析Spring是怎么解析xml文件的：
+接着上面方法中的parseBeanDefinitionElement来分析Spring是怎么解析xml文件的：
 
 ```java
 public AbstractBeanDefinition parseBeanDefinitionElement(

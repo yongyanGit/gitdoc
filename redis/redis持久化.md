@@ -13,7 +13,6 @@ RDB持久化是把当前进程数据生成快照保存到硬盘的过程，触�
 * save 命令：阻塞当前redis服务器，直到RDB过程完成为止，对于内存比较大的实例会造成长时间的阻塞，所以线上已经不建议使用。
 * bgsave命令：redis进程执行fork操作创建子线程，RDB持久化过程由子线程负责，完成后自动结束。阻塞只发生在fork阶段，一般时间很短。
 
-
 **手动触发** 
 
 两种方式都是直接在客户端执行save或者bgsave命令，如果命令执行成功，就会在redis启动目录下生成dump.rdb文件(默认)。
@@ -129,7 +128,7 @@ Redis提供了多种AOF缓冲区同步文件策略，由参数appebdfsync控制�
 
 2. 重写机制
 
-随着命令不断写入AOF，文件会越来越大，为了解决这个问题，Redis引入AOF重写机制压缩文件体积。AOF文件重写是把Redis进程内的数据转化为写命令同步到新AOF文件的过程。重写降低了文件占用空间，Redis可以跟快的加载文件。
+随着命令不断写入AOF，文件会越来越大，为了解决这个问题，Redis引入AOF重写机制压缩文件体积。AOF文件重写是把Redis进程内的数据转化为写命令同步到新AOF文件的过程。重写降低了文件占用空间，Redis可以更快的加载文件。
 
 重写AOF主要是做以下内容：
 
@@ -150,7 +149,7 @@ auto-aof-rewrite-min-size：表示运行AOF重写时文件最小体积，默认�
 
 auto-aof-rewrite-percentage：代表当前AOF文件空间（aof_current_size）和上一次重写后AOF文件空间（aof_base_size）的比值。
 
-自动触发时机＝aof_current_size > auto-aof-rewrite-min-size &&(aof_current_size-aof_base_size)/aof_base_size >= auto-aof-rewrite-percentage
+自动触发时机： aof_current_size > auto-aof-rewrite-min-size  或者  (aof_current_size-aof_base_size)/aof_base_size >= auto-aof-rewrite-percentage
 
 ![rewrite](../images/redis/rewrite.png)
 
@@ -271,4 +270,4 @@ AOF阻塞问题定位：
 * 每当发生AOF追加阻塞事件发生时，在info Persistence统计中,aof_delayed_fsync指标会累加，查看这个指标方便定位AOF阻塞问题。
 * 当延迟发生时说明硬盘存在高负载问题，可以通过监控工具iotop，定位消耗硬盘io资源的进程。
 
-
+ 

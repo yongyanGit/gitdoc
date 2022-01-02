@@ -237,7 +237,15 @@ private Map<String, Class<?>> loadExtensionClasses() {
 }
 ```
 
-loadFile的实现，一行一行的读取配置文件，再通过类加载器加载类。如果类是包装类则缓存到cachedWrapperClasses集合中；如果不是包装类并且它有Adaptive注解则将类缓存到cachedAdaptiveClass引用上，只能有一个Adaptive类；如果类上有Activate注解，则缓存到cachedActivates集合；最后将类与名称的映射存储到cachedNames集合，名称与类的映射存储到extensionClasses集合。
+loadFile的实现，一行一行的读取配置文件，再通过类加载器加载类。
+
+如果类是包装类则缓存到cachedWrapperClasses集合中。
+
+如果不是包装类并且它有Adaptive注解则将类缓存到cachedAdaptiveClass引用上，只能有一个Adaptive类。
+
+如果类上有Activate注解，则缓存到cachedActivates集合。
+
+最后将类与名称的映射存储到cachedNames集合，名称与类的映射存储到extensionClasses集合。
 
 ```java
 private void loadFile(Map<String, Class<?>> extensionClasses, String dir) {
@@ -270,7 +278,7 @@ private void loadFile(Map<String, Class<?>> extensionClasses, String dir) {
                  //如果是包装类，则缓存到cachedWrapperClasses集合中
                  wrappers.add(clazz);
               } catch (NoSuchMethodException e) {
-             	//如果不是包装类，则默认缓存到
+             	//如果不是包装类
                 //检查是否有默认构造函数
              	clazz.getConstructor();
              	if (names != null && names.length > 0) {

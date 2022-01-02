@@ -253,6 +253,6 @@ doSomethingWithConfig();
 
 在每个volatile写操作的后面插入一个StoreLoad屏障。 该屏障除了使volatile写操作不会与之后的读操作重排序外，还会刷新处理器缓存，使volatile变量的写更新对其他线程可见。
 
-在每个volatile读操作的前面插入一个LoadLoad屏障。 该屏障除了使volatile读操作不会与之前的写操作发生重排序外，还会刷新处理器缓存，使volatile变量读取的为最新值。
+在每个volatile读操作的前面插入一个LoadLoad屏障。 该屏障除了使volatile读操作不会与之前的写操作发生重排序外，还会刷新处理器缓存，使volatile变量读取的为最新值 。
 
 在每个volatile读操作的后面插入一个LoadStore屏障。 该屏障除了禁止了volatile读操作与其之后的任何写操作进行重排序，还会保证后续写入操作被执行前，保证读取的数据被读取完毕。
