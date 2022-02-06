@@ -123,7 +123,7 @@ additionalAuthenticationChecks(user,
 
 #### 5. 访问TokenEndpoint的/oauth/token接口
 
-2. 在postAccessToken方法中会调用CompositeTokenGranter.grant方法。
+1. 在postAccessToken方法中会调用CompositeTokenGranter.grant方法。
 
 ```java
 OAuth2AccessToken token = getTokenGranter().grant(tokenRequest.getGrantType(), tokenRequest);
@@ -134,7 +134,7 @@ OAuth2AccessToken token = getTokenGranter().grant(tokenRequest.getGrantType(), t
 
 #### 6. CompositeTokenGranter。
 
-循环tokenGranters集合，调用grant方法。
+循环tokenGranters集合，调用AbstractTokenGranter.grant方法。
 
 ```java
 
@@ -165,7 +165,7 @@ return getAccessToken(client, tokenRequest);
 
 ```
 
-* getAccessToken方法，先调用getOAuth2Authentication方法，验证用户信息，在调用createAccessToken方法创建token，并返回token。
+* getAccessToken方法，先调用getOAuth2Authentication方法，验证用户信息，再调用createAccessToken方法创建token，并返回token。
 
 ```java
 protected OAuth2AccessToken getAccessToken(ClientDetails client, TokenRequest tokenRequest) {
@@ -192,6 +192,21 @@ Map<String, String> parameters = new LinkedHashMap<String, String>(tokenRequest.
 		}
 ```
 
+#### 9.DefaultTokenServices
+
+创建token，并将token信息保存到缓存中。
+
+```java
+public OAuth2AccessToken createAccessToken(OAuth2Authentication authentication) throws AuthenticationException {
+//创建 token		
+OAuth2AccessToken accessToken = createAccessToken(authentication, refreshToken);
+    //保存token
+		tokenStore.storeAccessToken(accessToken, authentication);
+}
+```
+
+
+
 #### 附：密码模式认证流程
 
 密码模式与前面的区别是过滤器BasicAuthenticationFilter换成了UsernamePasswordAuthenticationFilter，在密码模式下，username和password是用户表单提交的用户和密码。
@@ -213,12 +228,12 @@ public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain)
 			ServletException {
     //获取前端传送的token
 	Authentication authentication = tokenExtractor.extract(request);
-    //登录认证
+    //获取token信息、用户信息
     Authentication authResult = authenticationManager.authenticate(authentication);
 }
 ```
 
-2. 获取用户请求token。
+2. 获取前端用户请求token。
 
 ```java
 protected String extractHeaderToken(HttpServletRequest request) {
@@ -246,9 +261,42 @@ protected String extractHeaderToken(HttpServletRequest request) {
 	}
 ```
 
-3. 调用OAuth2AuthenticationManager.authenticate获取token，验证token的有效性。
+3. 调用OAuth2AuthenticationManager.authenticate获取用户信息。实现逻辑在DefaultTokenServices类中。
+
+
+   ```java
+   public OAuth2Authentication loadAuthentication(String accessTokenValue) throws AuthenticationException,
+   			InvalidTokenException {
+     //获取缓存中的token              
+   		OAuth2AccessToken accessToken = tokenStore.readAccessToken(accessTokenValue);
+   		if (accessToken == null) {
+   			throw new InvalidTokenException("Invalid access token: " + accessTokenValue);
+   		}
+   		else if (accessToken.isExpired()) {
+   			tokenStore.removeAccessToken(accessToken);
+   			throw new InvalidTokenException("Access token expired: " + accessTokenValue);
+   		}
+   //获取用户认证信息。包括权限、账号有效期等。
+   		OAuth2Authentication result = tokenStore.readAuthentication(accessToken);
+   		if (result == null) {
+   			// in case of race condition
+   			throw new InvalidTokenException("Invalid access token: " + accessTokenValue);
+   		}
+   		if (clientDetailsService != null) {
+   			String clientId = result.getOAuth2Request().getClientId();
+   			try {
+   				clientDetailsService.loadClientByClientId(clientId);
+   			}
+   			catch (ClientRegistrationException e) {
+   				throw new InvalidTokenException("Client not valid: " + clientId, e);
+   			}
+   		}
+   		return result;
+   	}
+   ```
+
+   ​
 
 4. 调用FilterSecurityInterceptor过滤器,，进行权限校验。
-
 
 

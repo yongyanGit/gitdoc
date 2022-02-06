@@ -2,7 +2,7 @@
 
 #### 一、dubbo的LoadBalance接口
 
-dubbo的负载均衡策略，主体向外暴露出来是一个接口，名字叫做loadBlace,位于com.alibaba.dubbo.rpc.cluster包下，很明显根据包名就可以看出它是用来管理集群的：
+dubbo的负载均衡策略，主体向外暴露出来是一个接口，名字叫做loadBlance,位于com.alibaba.dubbo.rpc.cluster包下，很明显根据包名就可以看出它是用来管理集群的：
 
 这个接口就一个方法，select方法的作用就是从众多的调用的List选择出一个调用者，Invoker可以理解为客户端的调用者，dubbo专门封装一个类来表示，URL就是调用者发起的URL请求链接，从这个URL中可以获取很多请求的具体信息,Invocation表示的是调用的具体过程
 
@@ -466,6 +466,290 @@ public class RoundRobinLoadBalance extends AbstractLoadBalance {
     }
 }
 ```
+
+如上，RoundRobinLoadBalance 的每行代码都不是很难理解，但是将它们组合到一起之后，好像就看不懂了。这里对上面代码的主要逻辑进行总结，如下：
+
+1. 找到最大权重值，并计算出权重和
+2. 使用调用编号对权重总和进行取余操作，得到 mod
+3. 检测 mod 的值是否等于0，且 Invoker 权重是否大于0，如果两个条件均满足，则返回该 Invoker
+4. 如果上面条件不满足，且 Invoker 权重大于0，此时对 mod 和权重进行递减
+5. 再次循环，重复步骤3、4
+
+以上过程对应的原理不太好解释，所以下面直接举例说明把。假设我们有三台服务器 servers = [A, B, C]，对应的权重为 weights = [2, 5, 1]。接下来对上面的逻辑进行简单的模拟。
+
+mod = 0：满足条件，此时直接返回服务器 A
+
+mod = 1：需要进行一次递减操作才能满足条件，此时返回服务器 B
+
+mod = 2：需要进行两次递减操作才能满足条件，此时返回服务器 C
+
+mod = 3：需要进行三次递减操作才能满足条件，经过递减后，服务器权重为 [1, 4, 0]，此时返回服务器 A
+
+mod = 4：需要进行四次递减操作才能满足条件，经过递减后，服务器权重为 [0, 4, 0]，此时返回服务器 B
+
+mod = 5：需要进行五次递减操作才能满足条件，经过递减后，服务器权重为 [0, 3, 0]，此时返回服务器 B
+
+mod = 6：需要进行六次递减操作才能满足条件，经过递减后，服务器权重为 [0, 2, 0]，此时返回服务器 B
+
+mod = 7：需要进行七次递减操作才能满足条件，经过递减后，服务器权重为 [0, 1, 0]，此时返回服务器 B
+
+经过8次调用后，我们得到的负载均衡结果为 [A, B, C, A, B, B, B, B]，次数比 A:B:C =  2:5:1，等于权重比。当 sequence = 8 时，mod = 0，此时重头再来。从上面的模拟过程可以看出，当 mod >= 3  后，服务器 C 就不会被选中了，因为它的权重被减为0了。当 mod >= 4 后，服务器 A 的权重被减为0，此后 A 就不会再被选中。
+
+以上是 2.6.4 版本的 RoundRobinLoadBalance 分析过程，大家如果看不懂，自己可以定义一些权重组合进行模拟。也可以写点测试用例，进行调试分析，总之不要死看。
+
+2.6.4 版本的 RoundRobinLoadBalance 存在着比较严重的性能问题，该问题最初是在 [issue #2578](https://link.segmentfault.com/?enc=fSHluQ0Tz%2BuCwPYQjbXVxg%3D%3D.JDbbiJX0JTO%2FvEjK7j%2FVQg%2F9eWFXycxHoibzqxlgMgSbDzkW0ZF7z1dD51D%2FR6Tl4szpd80mIHjwuzO7m%2BsMWw%3D%3D) 中被反馈出来。问题出在了 Invoker 的返回时机上，RoundRobinLoadBalance 需要在`mod == 0 && v.getValue() > 0` 条件成立的情况下才会被返回相应的 Invoker。假如 mod 很大，比如 10000，50000，甚至更大时，doSelect  方法需要进行很多次计算才能将 mod 减为0。由此可知，doSelect 的效率与 mod 有关，时间复杂度为 O(mod)。mod  又受最大权重 maxWeight 的影响，因此当某个服务提供者配置了非常大的权重，此时 RoundRobinLoadBalance  会产生比较严重的性能问题。这个问题被反馈后，社区很快做了回应。并对 RoundRobinLoadBalance  的代码进行了重构，将时间复杂度优化至了常量级别。这个优化可以说很好了，下面我们来学习一下优化后的代码。
+
+```java
+public class RoundRobinLoadBalance extends AbstractLoadBalance {
+
+    public static final String NAME = "roundrobin";
+
+    private final ConcurrentMap<String, AtomicPositiveInteger> sequences = new ConcurrentHashMap<String, AtomicPositiveInteger>();
+
+    private final ConcurrentMap<String, AtomicPositiveInteger> indexSeqs = new ConcurrentHashMap<String, AtomicPositiveInteger>();
+
+    @Override
+    protected <T> Invoker<T> doSelect(List<Invoker<T>> invokers, URL url, Invocation invocation) {
+        String key = invokers.get(0).getUrl().getServiceKey() + "." + invocation.getMethodName();
+        int length = invokers.size();
+        int maxWeight = 0;
+        int minWeight = Integer.MAX_VALUE;
+        final List<Invoker<T>> invokerToWeightList = new ArrayList<>();
+        
+        // 查找最大和最小权重
+        for (int i = 0; i < length; i++) {
+            int weight = getWeight(invokers.get(i), invocation);
+            maxWeight = Math.max(maxWeight, weight);
+            minWeight = Math.min(minWeight, weight);
+            if (weight > 0) {
+                invokerToWeightList.add(invokers.get(i));
+            }
+        }
+        
+        // 获取当前服务对应的调用序列对象 AtomicPositiveInteger
+        AtomicPositiveInteger sequence = sequences.get(key);
+        if (sequence == null) {
+            // 创建 AtomicPositiveInteger，默认值为0
+            sequences.putIfAbsent(key, new AtomicPositiveInteger());
+            sequence = sequences.get(key);
+        }
+        
+        // 获取下标序列对象 AtomicPositiveInteger
+        AtomicPositiveInteger indexSeq = indexSeqs.get(key);
+        if (indexSeq == null) {
+            // 创建 AtomicPositiveInteger，默认值为 -1
+            indexSeqs.putIfAbsent(key, new AtomicPositiveInteger(-1));
+            indexSeq = indexSeqs.get(key);
+        }
+
+        if (maxWeight > 0 && minWeight < maxWeight) {
+            length = invokerToWeightList.size();
+            while (true) {
+                int index = indexSeq.incrementAndGet() % length;
+                int currentWeight = sequence.get() % maxWeight;
+
+                // 每循环一轮（index = 0），重新计算 currentWeight
+                if (index == 0) {
+                    currentWeight = sequence.incrementAndGet() % maxWeight;
+                }
+                
+                // 检测 Invoker 的权重是否大于 currentWeight，大于则返回
+                if (getWeight(invokerToWeightList.get(index), invocation) > currentWeight) {
+                    return invokerToWeightList.get(index);
+                }
+            }
+        }
+        
+        // 所有 Invoker 权重相等，此时进行普通的轮询即可
+        return invokers.get(sequence.incrementAndGet() % length);
+    }
+}
+```
+
+上面代码的逻辑是这样的，每进行一轮循环，重新计算 currentWeight。如果当前 Invoker 权重大于 currentWeight，则返回该 Invoker。还是举例说明吧，假设服务器 [A, B, C] 对应权重 [5, 2, 1]。
+
+第一轮循环，currentWeight = 1，可返回 A 和 B
+
+第二轮循环，currentWeight = 2，返回 A
+
+第三轮循环，currentWeight = 3，返回 A
+
+第四轮循环，currentWeight = 4，返回 A
+
+第五轮循环，currentWeight = 0，返回 A, B, C
+
+如上，这里的一轮循环是指 index 再次变为0所经历过的循环，这里可以把 index = 0 看做是一轮循环的开始。每一轮循环的次数与 Invoker 的数量有关，Invoker 数量通常不会太多，所以我们可以认为上面代码的时间复杂度为常数级。
+
+重构后的 RoundRobinLoadBalance 看起来已经很不错了，但是在代码更新不久后，很有又被重构了。这次重构原因是新的  RoundRobinLoadBalance 在某些情况下选出的服务器序列不够均匀。比如，服务器 [A, B, C] 对应权重 [5, 1,  1]。现在进行7次负载均衡，选择出来的序列为 [A, A, A, A, A, B, C]。前5个请求全部都落在了服务器  A上，分布不够均匀。这将会使服务器 A 短时间内接收大量的请求，压力陡增。而 B 和 C 无请求，处于空闲状态。我们期望的结果是这样的 [A,  A, B, A, C, A, A]，不同服务器可以穿插获取请求。为了增加负载均衡结果的平滑性，社区再次对  RoundRobinLoadBalance 的实现进行了重构。这次重构参考自 Nginx  的平滑加权轮询负载均衡，实现原理是这样的。每个服务器对应两个权重，分别为 weight 和 currentWeight。其中 weight  是固定的，currentWeight 是会动态调整，初始值为0。当有新的请求进来时，遍历服务器列表，让它的 currentWeight  加上自身权重。遍历完成后，找到最大的 currentWeight，并将其减去权重总和，然后返回相应的服务器即可。
+
+上面描述不是很好理解，下面还是举例说明吧。仍然使用服务器 [A, B, C] 对应权重 [5, 1, 1] 的例子进行说明，现在有7个请求依次进入负载均衡逻辑，选择过程如下：
+
+| 请求编号 | currentWeight 数组 | 选择结果 | 减去权重总和后的 currentWeight 数组 |
+| -------- | ------------------ | -------- | ----------------------------------- |
+| 1        | [5, 1, 1]          | A        | [-2, 1, 1]                          |
+| 2        | [3, 2, 2]          | A        | [-4, 2, 2]                          |
+| 3        | [1, 3, 3]          | B        | [1, -4, 3]                          |
+| 4        | [6, -3, 4]         | A        | [-1, -3, 4]                         |
+| 5        | [4, -2, 5]         | C        | [4, -2, -2]                         |
+| 6        | [9, -1, -1]        | A        | [2, -1, -1]                         |
+| 7        | [7, 0, 0]          | A        | [0, 0, 0]                           |
+
+如上，经过平滑性处理后，得到的服务器序列为 [A, A, B, A, C, A, A]，相比之前的序列 [A, A, A, A, A,  B, C]，分布性要好一些。初始情况下 currentWeight = [0, 0, 0]，第7个请求处理完后，currentWeight  再次变为 [0, 0, 0]，是不是很神奇。这个结果也不难理解，在7次计算过程中，每个服务器的 currentWeight 都增加了自身权重  weight  *7，得到 currentWeight = [35, 7, 7]，A 被选中5次，要被减去 5*  7。B 和 C 被选中1次，要被减去 1 * 7。于是 currentWeight = [35, 7, 7] - [35, 7, 7] = [0, 0, 0]。
+
+以上就是平滑加权轮询的计算过程，现在大家应该对平滑加权轮询算法了有了一些了解。接下来，我们来看看 Dubbo-2.6.5 是如何实现上面的计算过程的。
+
+public class RoundRobinLoadBalance extends AbstractLoadBalance {
+    public static final String NAME = "roundrobin";
+    
+```java
+private static int RECYCLE_PERIOD = 60000;
+
+protected static class WeightedRoundRobin {
+    // 服务提供者权重
+    private int weight;
+    // 当前权重
+    private AtomicLong current = new AtomicLong(0);
+    // 最后一次更新时间
+    private long lastUpdate;
+    
+    public void setWeight(int weight) {
+        this.weight = weight;
+        // 初始情况下，current = 0
+        current.set(0);
+    }
+    public long increaseCurrent() {
+        // current = current + weight；
+        return current.addAndGet(weight);
+    }
+    public void sel(int total) {
+        // current = current - total;
+        current.addAndGet(-1 * total);
+    }
+}
+
+// 嵌套 Map 结构，存储的数据结构示例如下：
+// {
+//     "UserService.query": {
+//         "url1": WeightedRoundRobin@123, 
+//         "url2": WeightedRoundRobin@456, 
+//     },
+//     "UserService.update": {
+//         "url1": WeightedRoundRobin@123, 
+//         "url2": WeightedRoundRobin@456,
+//     }
+// }
+// 最外层为服务类名 + 方法名，第二层为 url 到 WeightedRoundRobin 的映射关系。
+// 这里我们可以将 url 看成是服务提供者的 id
+private ConcurrentMap<String, ConcurrentMap<String, WeightedRoundRobin>> methodWeightMap = new ConcurrentHashMap<String, ConcurrentMap<String, WeightedRoundRobin>>();
+
+// 原子更新锁
+private AtomicBoolean updateLock = new AtomicBoolean();
+
+@Override
+protected <T> Invoker<T> doSelect(List<Invoker<T>> invokers, URL url, Invocation invocation) {
+    String key = invokers.get(0).getUrl().getServiceKey() + "." + invocation.getMethodName();
+    // 获取 url 到 WeightedRoundRobin 映射表，如果为空，则创建一个新的
+    ConcurrentMap<String, WeightedRoundRobin> map = methodWeightMap.get(key);
+    if (map == null) {
+        methodWeightMap.putIfAbsent(key, new ConcurrentHashMap<String, WeightedRoundRobin>());
+        map = methodWeightMap.get(key);
+    }
+    int totalWeight = 0;
+    long maxCurrent = Long.MIN_VALUE;
+    
+    // 获取当前时间
+    long now = System.currentTimeMillis();
+    Invoker<T> selectedInvoker = null;
+    WeightedRoundRobin selectedWRR = null;
+
+    // 下面这个循环主要做了这样几件事情：
+    //   1. 遍历 Invoker 列表，检测当前 Invoker 是否有
+    //      对应的 WeightedRoundRobin，没有则创建
+    //   2. 检测 Invoker 权重是否发生了变化，若变化了，
+    //      则更新 WeightedRoundRobin 的 weight 字段
+    //   3. 让 current 字段加上自身权重，等价于 current += weight
+    //   4. 设置 lastUpdate 字段，即 lastUpdate = now
+    //   5. 寻找具有最大 current 的 Invoker 以及 WeightedRoundRobin，
+    //      暂存起来，留作后用
+    //   6. 计算权重总和
+    for (Invoker<T> invoker : invokers) {
+        String identifyString = invoker.getUrl().toIdentityString();
+        WeightedRoundRobin weightedRoundRobin = map.get(identifyString);
+        int weight = getWeight(invoker, invocation);
+        if (weight < 0) {
+            weight = 0;
+        }
+        
+        // 检测当前 Invoker 是否有对应的 WeightedRoundRobin，没有则创建
+        if (weightedRoundRobin == null) {
+            weightedRoundRobin = new WeightedRoundRobin();
+            // 设置 Invoker 权重
+            weightedRoundRobin.setWeight(weight);
+            // 存储 url 唯一标识 identifyString 到 weightedRoundRobin 的映射关系
+            map.putIfAbsent(identifyString, weightedRoundRobin);
+            weightedRoundRobin = map.get(identifyString);
+        }
+        // Invoker 权重不等于 WeightedRoundRobin 中保存的权重，说明权重变化了，此时进行更新
+        if (weight != weightedRoundRobin.getWeight()) {
+            weightedRoundRobin.setWeight(weight);
+        }
+        
+        // 让 current 加上自身权重，等价于 current += weight
+        long cur = weightedRoundRobin.increaseCurrent();
+        // 设置 lastUpdate，表示近期更新过
+        weightedRoundRobin.setLastUpdate(now);
+        // 找出最大的 current 
+        if (cur > maxCurrent) {
+            maxCurrent = cur;
+            // 将具有最大 current 权重的 Invoker 赋值给 selectedInvoker
+            selectedInvoker = invoker;
+            // 将 Invoker 对应的 weightedRoundRobin 赋值给 selectedWRR，留作后用
+            selectedWRR = weightedRoundRobin;
+        }
+        
+        // 计算权重总和
+        totalWeight += weight;
+    }
+
+    // 对 <identifyString, WeightedRoundRobin> 进行检查，过滤掉长时间未被更新的节点。
+    // 该节点可能挂了，invokers 中不包含该节点，所以该节点的 lastUpdate 长时间无法被更新。
+    // 若未更新时长超过阈值后，就会被移除掉，默认阈值为60秒。
+    if (!updateLock.get() && invokers.size() != map.size()) {
+        if (updateLock.compareAndSet(false, true)) {
+            try {
+                ConcurrentMap<String, WeightedRoundRobin> newMap = new ConcurrentHashMap<String, WeightedRoundRobin>();
+                // 拷贝
+                newMap.putAll(map);
+                
+                // 遍历修改，也就是移除过期记录
+                Iterator<Entry<String, WeightedRoundRobin>> it = newMap.entrySet().iterator();
+                while (it.hasNext()) {
+                    Entry<String, WeightedRoundRobin> item = it.next();
+                    if (now - item.getValue().getLastUpdate() > RECYCLE_PERIOD) {
+                        it.remove();
+                    }
+                }
+                
+                // 更新引用
+                methodWeightMap.put(key, newMap);
+            } finally {
+                updateLock.set(false);
+            }
+        }
+    }
+
+    if (selectedInvoker != null) {
+        // 让 current 减去权重总和，等价于 current -= totalWeight
+        selectedWRR.sel(totalWeight);
+        // 返回具有最大 current 的 Invoker
+        return selectedInvoker;
+    }
+    
+    // should not happen here
+    return invokers.get(0);
+}
+```
+
 
 
 

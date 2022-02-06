@@ -101,7 +101,6 @@ lock table person write; --session A释放锁之前，SessionB会一直阻塞
 
   如上sql使用二级索引来查询，首先在name = tom的二级索引上加锁，然后根据主键去检索聚簇索引在相应的主键索引上加锁。
 
-  
 
 #### 锁的算法
 

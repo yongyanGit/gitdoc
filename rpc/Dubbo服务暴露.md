@@ -308,7 +308,7 @@ protected void doRegister(URL url) {
 
 ```java
 public void create(String path, boolean ephemeral) {
-    //节点目录  /dubbo/com.xx.Iservice
+    //节点目录  /dubbo/com.alibaba.dubbo.demo.DemoService/providers/
    int i = path.lastIndexOf('/');
    if (i > 0) {
        //递归调用，创建数据节点目录

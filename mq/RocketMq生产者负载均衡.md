@@ -13,52 +13,121 @@ Producer端，每个实例在发消息的时候，默认会-轮询（调度方�
 - 在发送消息的时候会记录一下调用的时间与是否报错，根据该时间去预测broker的可用时间
 
 ```java
-//获取重试发送次数
-int timesTotal = communicationMode == CommunicationMode.SYNC ? 1 + this.defaultMQProducer.getRetryTimesWhenSendFailed() : 1;
-int times = 0;
-String[] brokersSent = new String[timesTotal];
-//循环，如果发送失败会进行重试
-for (; times < timesTotal; times++) {
- //记录当前发送的BrokerName，如果此次发送失败，下次循环重试时，可以过滤掉broker
- String lastBrokerName = null == mq ? null : mq.getBrokerName();
- //选择队列
- MessageQueue mqSelected = this.selectOneMessageQueue(topicPublishInfo, lastBrokerName);
- if (mqSelected != null) {
-     mq = mqSelected;
- }
-}
+public SendResult send(Message msg) throws MQClientException, RemotingException, MQBrokerException, InterruptedException {
+  	//获取发送超时时间
+        return send(msg, this.defaultMQProducer.getSendMsgTimeout());
+    }
+
+public SendResult send(Message msg, long timeout) throws MQClientException, RemotingException, MQBrokerException, InterruptedException {
+        return this.sendDefaultImpl(msg, CommunicationMode.SYNC, null, timeout);
+    }
+
+private SendResult sendDefaultImpl(
+        Message msg,
+        final CommunicationMode communicationMode,
+        final SendCallback sendCallback,
+        final long timeout
+    ) throws MQClientException, RemotingException, MQBrokerException, InterruptedException {
+        this.makeSureStateOK(); // 确保在运行 ServiceState.RUNNING
+        Validators.checkMessage(msg, this.defaultMQProducer);
+        final long invokeID = random.nextLong();
+   			//记录开始时间
+        long beginTimestampFirst = System.currentTimeMillis();
+        long beginTimestampPrev = beginTimestampFirst;
+        long endTimestamp = beginTimestampFirst;
+   			//获取主题信息
+        TopicPublishInfo topicPublishInfo = this.tryToFindTopicPublishInfo(msg.getTopic());
+        if (topicPublishInfo != null && topicPublishInfo.ok()) {
+            boolean callTimeout = false;
+            MessageQueue mq = null;
+            Exception exception = null;
+            SendResult sendResult = null; 
+          	// 同步timesTotal默认是3  非同步1 defaultMQProducer.getRetryTimesWhenSendFailed():2
+            int timesTotal = communicationMode == CommunicationMode.SYNC ? 1 + this.defaultMQProducer.getRetryTimesWhenSendFailed() : 1;
+            int times = 0;
+            String[] brokersSent = new String[timesTotal];
+          	// 重试循环
+            for (; times < timesTotal; times++) { 
+              	// 最初mq=null  所以lastBrokerName也是null 第2次循环就有值了
+                String lastBrokerName = null == mq ? null : mq.getBrokerName(); 
+                MessageQueue mqSelected = this.selectOneMessageQueue(topicPublishInfo, lastBrokerName);
+                if (mqSelected != null) {
+                  // 设置lastBroker
+                    mq = mqSelected; 
+                    brokersSent[times] = mq.getBrokerName();
+                    try {
+                        beginTimestampPrev = System.currentTimeMillis();
+                        if (times > 0) {
+              			    msg.setTopic(this.defaultMQProducer.withNamespace(msg.getTopic()));
+                        }
+                      	//选择队列花费的时间
+                        long costTime = beginTimestampPrev - beginTimestampFirst;
+                      	// 超时
+                        if (timeout < costTime) { 
+                            callTimeout = true;
+                            break;
+                        }
+                      
+                        // 剩余的超时时间 = timeout - costTime
+                        sendResult = this.sendKernelImpl(msg, mq, communicationMode, sendCallback, topicPublishInfo, timeout - costTime);
+                        endTimestamp = System.currentTimeMillis(); 
+                        this.updateFaultItem(mq.getBrokerName(), endTimestamp - beginTimestampPrev, false); 
+                        ............
+                    } catch (RemotingException e) {
+                        endTimestamp = System.currentTimeMillis();
+                        this.updateFaultItem(mq.getBrokerName(), endTimestamp - beginTimestampPrev, true); // TODO updateFaultItem
+                        log.warn(String.format("sendKernelImpl exception, resend at once, InvokeID: %s, RT: %sms, Broker: %s", invokeID, endTimestamp - beginTimestampPrev, mq), e);
+                        log.warn(msg.toString());
+                        exception = e;
+                        continue;
+                    } 
+                    .................
+
 ```
 
-并不是所有异常情况下都会进行重试，RemotingException远程调用异常、MQClientException客户端异常会进行重试，但是如果是MQBrokerException并且不是如下异常则会直接返回异常结果：
+updateFaultItem方法
 
 ```java
-case ResponseCode.TOPIC_NOT_EXIST:
-case ResponseCode.SERVICE_NOT_AVAILABLE:
-case ResponseCode.SYSTEM_ERROR:
-case ResponseCode.NO_PERMISSION:
-case ResponseCode.NO_BUYER_ID:
-case ResponseCode.NOT_IN_CURRENT_UNIT:
-```
-
-发送失败的broker信息会保存在map集合中，当在开启延迟容错条件下，会在该集合中选择一个broker来发送消息。
-
-```java
-} catch (RemotingException e) {
-    endTimestamp = System.currentTimeMillis();
-    this.updateFaultItem(mq.getBrokerName(), endTimestamp - beginTimestampPrev, true);
-    log.warn(String.format("sendKernelImpl exception, resend at once, InvokeID: %s, RT: %sms, Broker: %s", invokeID, endTimestamp - beginTimestampPrev, mq), e);
-    log.warn(msg.toString());
-    exception = e;
-    continue;
-}
-
+//currentLatency 发送消息花费的时间；当发送失败时，isolation为true
 public void updateFaultItem(final String brokerName, final long currentLatency, boolean isolation) {
+  			//开启延迟容错
         if (this.sendLatencyFaultEnable) {
+          	//获取broker不可用时间
             long duration = computeNotAvailableDuration(isolation ? 30000 : currentLatency);
             //更新发送失败broker信息
             this.latencyFaultTolerance.updateFaultItem(brokerName, currentLatency, duration);
         }
 }
+
+
+    //返回duration  先判断currentLatency在latencyMax那个位置  然后返回 notAvailableDuration的该位置的值  
+    // 假设latencyMax=3500   则返回180000L
+    private long computeNotAvailableDuration(final long currentLatency) { // TODO updateFaultItem
+        for (int i = latencyMax.length - 1; i >= 0; i--) {
+            if (currentLatency >= latencyMax[i]) // latencyMax: {50L, 100L, 550L, 1000L, 2000L, 3000L, 15000L}
+                return this.notAvailableDuration[i]; // {0L, 0L, 30000L, 60000L, 120000L, 180000L, 600000L} // ms
+        }
+        return 0;
+    }
+
+public void updateFaultItem(final String name, final long currentLatency, final long notAvailableDuration) {
+        FaultItem old = this.faultItemTable.get(name);
+        if (null == old) {
+            final FaultItem faultItem = new FaultItem(name);
+            faultItem.setCurrentLatency(currentLatency); // 设置花费时间
+          	// 设置不可用时间点
+            faultItem.setStartTimestamp(System.currentTimeMillis() + notAvailableDuration); 
+            old = this.faultItemTable.putIfAbsent(name, faultItem);
+            if (old != null) {
+                old.setCurrentLatency(currentLatency);
+                old.setStartTimestamp(System.currentTimeMillis() + notAvailableDuration);
+            }
+        } else {
+            old.setCurrentLatency(currentLatency);
+            old.setStartTimestamp(System.currentTimeMillis() + notAvailableDuration);
+        }
+}
+
 ```
 
 在没有开启延迟容错下的条件下选择消息队列时会过滤掉lastBrokerName下的队列：
@@ -123,7 +192,8 @@ public MessageQueue selectOneMessageQueue(final TopicPublishInfo tpInfo, final S
                         return mq;
                 }
             }
-//从容错信息中取一个Broker
+          
+						//从容错信息中取一个Broker
             final String notBestBroker = latencyFaultTolerance.pickOneAtLeast();
             int writeQueueNums = tpInfo.getQueueIdByBroker(notBestBroker);
             //有可写的队列
@@ -133,10 +203,11 @@ public MessageQueue selectOneMessageQueue(final TopicPublishInfo tpInfo, final S
                     //将取到的队列信息设置为取到的broker
                     mq.setBrokerName(notBestBroker);
                     //队列重置
-                    mq.setQueueId(tpInfo.getSendWhichQueue().getAndIncrement() % writeQueueNums);
+                  mq.setQueueId(tpInfo.getSendWhichQueue().getAndIncrement() % writeQueueNums);
                 }
                 return mq;
             } else {
+              	//没有可写队列则移除该broker
                 latencyFaultTolerance.remove(notBestBroker);
             }
         } catch (Exception e) {
@@ -148,6 +219,88 @@ public MessageQueue selectOneMessageQueue(final TopicPublishInfo tpInfo, final S
 
     return tpInfo.selectOneMessageQueue(lastBrokerName);
 }
+
+
+public boolean isAvailable(final String name) {
+        final FaultItem faultItem = this.faultItemTable.get(name);
+        if (faultItem != null) {
+            return faultItem.isAvailable();
+        }
+        return true;
+}
+
+public boolean isAvailable() {
+            return (System.currentTimeMillis() - startTimestamp) >= 0;
+        }					
 ```
 
-​									
+```java
+    public String pickOneAtLeast() {
+    final Enumeration<FaultItem> elements = this.faultItemTable.elements();
+    List<FaultItem> tmpList = new LinkedList<FaultItem>();
+    while (elements.hasMoreElements()) {
+        final FaultItem faultItem = elements.nextElement();
+        tmpList.add(faultItem);
+    }
+    if (!tmpList.isEmpty()) {
+        Collections.shuffle(tmpList);
+        // 排序
+        Collections.sort(tmpList);
+        final int half = tmpList.size() / 2;
+        if (half <= 0) { // 只有1个
+            return tmpList.get(0).getName();
+        } else { // 大于1个
+          	// (第1次随机数+1)%half  (以后都是当前数+1)%half
+            final int i = this.whichItemWorst.getAndIncrement() % half; 
+            return tmpList.get(i).getName();
+        }
+    }
+
+    return null;
+}
+
+```
+
+排序算法： 先可用性 可用的（isAvailable（）==true）在最前，可用的一样，currentLatency小的在前，currentLatency一样，startTimestamp小的在前
+
+```java
+class FaultItem implements Comparable<FaultItem> {
+        private final String name;
+        private volatile long currentLatency;
+        private volatile long startTimestamp;
+
+        public FaultItem(final String name) {
+            this.name = name;
+        }
+
+        @Override 
+        public int compareTo(final FaultItem other) {
+            if (this.isAvailable() != other.isAvailable()) {
+                if (this.isAvailable()) //可用性优先级最高
+                    return -1;
+
+                if (other.isAvailable())
+                    return 1;
+            }
+
+            if (this.currentLatency < other.currentLatency)  // currentLatency小的在前
+                return -1;
+            else if (this.currentLatency > other.currentLatency) {
+                return 1;
+            }
+
+            if (this.startTimestamp < other.startTimestamp)  // startTimestamp小的在前
+                return -1;
+            else if (this.startTimestamp > other.startTimestamp) {
+                return 1;
+            }
+
+            return 0;
+        }
+
+        public boolean isAvailable() {
+            return (System.currentTimeMillis() - startTimestamp) >= 0;
+        }
+
+```
+
