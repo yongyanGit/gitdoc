@@ -272,7 +272,7 @@ private Node addWaiter(Node mode)
 
 在```addWarter()```方法中会调用```enq()```方法来初始化等待队列，它是一个链表。它除了初始化队列外，还是为了确保新增的节点会添加到链表的尾部。因为在并发环境中，cas函数有可能执行失败的。
 
-在```enq()```方法中，通过一个死循环不断的将node节点添加到链表的尾部，直到成功为止。
+在```enq()```方法中，通过一个死循环(自旋)不断的将node节点添加到链表的尾部，直到成功为止。
 
 ```java
 private Node enq(final Node node) {
@@ -292,7 +292,7 @@ private Node enq(final Node node) {
  }
 ```
 
-```acquireQueued()```尝试获取锁，如果获取锁成功，则会将头节点设置为持有锁的线程，并返回中断标志。
+```acquireQueued()```尝试获取锁，如果获取锁成功，则会将头节点设置为持有锁的线程，并返回中断标志。(自旋)
 
 如果获取失败，则会调用```LockSupport.park(this);```方法，使当前线程进入睡眠状态，直到被它的上一个节点唤醒。
 
@@ -311,7 +311,7 @@ boolean acquireQueued(final Node node, int arg) {
             failed = false;
             return interrupted;//返回中断标志
          }
-         //获取锁失败，将线程进入睡眠，等待它的上一个节点唤醒
+         //获取锁失败，线程进入睡眠，等待它的上一个节点唤醒
          if (shouldParkAfterFailedAcquire(p, node) &&
              parkAndCheckInterrupt())
              interrupted = true;

@@ -196,9 +196,12 @@ private void replaceStaleEntry(ThreadLocal<?> key, Object value,
             for (int i = prevIndex(staleSlot, len);
                  (e = tab[i]) != null;
                  i = prevIndex(i, len))
-                //记录无效槽的位置
+                //获取key,判断key是否为空，记录无效槽的位置
                 if (e.get() == null)
                     slotToExpunge = i;
+  						//================第一个for循环
+  
+   
            //向后遍历table，staleSlot指向无效的槽
             for (int i = nextIndex(staleSlot, len);
                  (e = tab[i]) != null;
@@ -235,7 +238,7 @@ private void replaceStaleEntry(ThreadLocal<?> key, Object value,
         }
 ```
 
-* cleanSomeSlots()：清除ThreadLocalMap中无效的元素。
+* cleanSomeSlots()：分段清除ThreadLocalMap中无效的元素。
 
 ```java
 private boolean cleanSomeSlots(int i, int n) {
@@ -257,7 +260,7 @@ private boolean cleanSomeSlots(int i, int n) {
         }
 ```
 
-* expungeStaleEntry(int staleSlot)方法，分段清理无效的元素，并重新计算元素的哈希值。这个staleSlot位置指向了一个key为null的entry节点。既然知道这个节点是没用的，那它就应该被回收。这里就很直接粗暴了，直接把它直接null以待后面垃圾回收器清理。清理完之后，又是一个for循环。如果key为null，将该entry置为null。如果不为null，重新计算一下hash值，如果位置与当前位置不同，需要重新找一个位置放该节点。当然也是利用线性探测法了，找到连续位置后面第一个为null的节点放置。最后返回的节点为从slotToExpunge往后的第一个值为null的entry节点。
+* expungeStaleEntry(int staleSlot)方法，清理无效的元素，并重新计算元素的哈希值。参数是key为null的槽的索引值，返回值是以staleSlot为起始位置，第一个空槽的索引值。
 
 ```java
 private int expungeStaleEntry(int staleSlot) {
@@ -531,5 +534,16 @@ private Entry getEntryAfterMiss(ThreadLocal<?> key, int i, Entry e) {
 ## ThreadLocal正确的使用方法
 
 - 每次使用完ThreadLocal都调用它的remove()方法清除数据
+
+  ```java
+  try {
+      // 其它业务逻辑
+  } finally {
+      threadLocal对象.remove();
+  }
+  ```
+
+  
+
 - 将ThreadLocal变量定义成private static，这样就一直存在ThreadLocal的强引用，也就能保证任何时候都能通过ThreadLocal的弱引用访问到Entry的value值，进而清除掉 。
 

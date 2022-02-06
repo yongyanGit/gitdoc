@@ -123,14 +123,14 @@ private void doAcquireSharedInterruptibly(int arg)
 ```java
 	public void countDown() {
         sync.releaseShared(1);//是否锁
+  }
+  public final boolean releaseShared(int arg) {
+  	if (tryReleaseShared(arg)) {//尝试释放锁
+       	doReleaseShared();//如果锁全部释放完，唤醒等待线程
+        return true;
     }
-    public final boolean releaseShared(int arg) {
-        if (tryReleaseShared(arg)) {//尝试释放锁
-            doReleaseShared();//如果锁全部释放完，唤醒等待线程
-            return true;
-        }
-        return false;
-    }
+    return false;
+ }
 ```
 
 * tryReleaseShared()：释放锁.
