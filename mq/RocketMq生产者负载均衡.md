@@ -186,14 +186,14 @@ public MessageQueue selectOneMessageQueue(final TopicPublishInfo tpInfo, final S
                     pos = 0;
                 //取出队列
                 MessageQueue mq = tpInfo.getMessageQueueList().get(pos);
-                //如果broker可用，并且它是上次发送失败的broker，则返回该broker的队列
+                //判断队列所属broker是否可用，如果它是上次发送失败的broker并且已经可用，则返回该broker的队列
                 if (latencyFaultTolerance.isAvailable(mq.getBrokerName())) {
                     if (null == lastBrokerName || mq.getBrokerName().equals(lastBrokerName))
                         return mq;
                 }
             }
           
-						//从容错信息中取一个Broker
+						//前面的逻辑是选择空闲的对列，如果没有空闲的对列，则选择一个快要可用的对列从
             final String notBestBroker = latencyFaultTolerance.pickOneAtLeast();
             int writeQueueNums = tpInfo.getQueueIdByBroker(notBestBroker);
             //有可写的队列
