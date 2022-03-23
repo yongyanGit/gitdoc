@@ -55,7 +55,7 @@
 
 **1.kafka：**
 
-- Kafka中的Message是以topic为基本单位组织的，不同的topic之间是相互独立的。每个topic又可以分成几个不同的partition(每个topic有几个partition是在创建topic时指定的)，每个partition存储一部分Message。
+- Kafka中的Message是以topic为基本单位组织的，不同的topic之间是相互独立的。每个topic又可以分成几个不同的partitio  n(每个topic有几个partition是在创建topic时指定的)，每个partition存储一部分Message。
 
 ![](../images/mq/30.png)
 
@@ -173,8 +173,8 @@
   3. 381M多的索引内容槽点，每个槽大小为20B，共2000W个槽点。
 - 头部信息如下：
     		1. beginTimestamp和endTimestamp分别是文件内包含的索引内容的起始时间和结束时间
-    		2. beginPhyOffset和endPhyOffset分别是文件内包含的索引内容的起始偏移量和结束偏移量。
-    		3. hashslotcount和indexCount记录当前hash槽点和索引内容槽点的数据量。
+      		2. beginPhyOffset和endPhyOffset分别是文件内包含的索引内容的起始偏移量和结束偏移量。
+        		3. hashslotcount和indexCount记录当前hash槽点和索引内容槽点的数据量。
 
 ![](../images/mq/40.png)
 
