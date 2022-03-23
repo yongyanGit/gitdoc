@@ -29,7 +29,7 @@ public ConcurrentHashMap(int initialCapacity) {
 public V put(K key, V value) {
     return putVal(key, value, false);
 }
-
+//自旋+同步锁(分段)
 final V putVal(K key, V value, boolean onlyIfAbsent) {
     if (key == null || value == null) throw new NullPointerException();
     // 得到 hash 值

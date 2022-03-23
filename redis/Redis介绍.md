@@ -107,6 +107,20 @@ raw和embstr的区别可以用下面两幅图所示：
 
 2、列表对象
 
+```
+redis 127.0.0.1:6379> LPUSH runoobkey redis
+(integer) 1
+redis 127.0.0.1:6379> LPUSH runoobkey mongodb
+(integer) 2
+redis 127.0.0.1:6379> LPUSH runoobkey mysql
+(integer) 3
+redis 127.0.0.1:6379> LRANGE runoobkey 0 10
+
+1) "mysql"
+2) "mongodb"
+3) "redis"
+```
+
 列表对象的编码可以是ziplist或者linkedlist。
 
 1. ziplist是一种压缩链表，它的好处是更能节省内存空间(碎片化少)，因为它所存储的内容都是在连续的内存区域当中的。当列表对象元素不大，每个元素也不大的时候，就采用ziplist存储但当数据量过大时就ziplist就不是那么好用了(数据量大，很难申请到连续空间)。因为为了保证他存储内容在内存中的连续性，插入的复杂度是O(N)，即每次插入都会重新进行realloc。如下图所示，对象结构中ptr所指向的就是一个ziplist整个ziplist只需要malloc一次，它们在内存中是一块连续的区域。
@@ -119,11 +133,33 @@ raw和embstr的区别可以用下面两幅图所示：
 
    ![](../images/redis/5.png)
 
+   * zlbytes: ziplist的长度（单位: 字节)，是一个32位无符号整数
+   * zltail: ziplist最后一个节点的偏移量，反向遍历ziplist或者pop尾部节点的时候有用。
+   * zllen: ziplist的节点（entry）个数
+   * entry: 节点，节点的长度由节点保存的内容决定
+   * zlend: 值为0xFF，用于标记ziplist的结尾
+
 2. linkedlist是一种双向链表。它的结构比较简单，节点中存放pre和next两个指针，还有节点相关的信息。当每增加一个node的时候，就需要重新malloc一块内存
 
    ![](../images/redis/6.png)
 
 3. 哈希对象
+
+   ```
+   127.0.0.1:6379>  HMSET runoobkey name "redis tutorial" description "redis basic commands for caching" likes 20 visitors 23000
+   OK
+   127.0.0.1:6379>  HGETALL runoobkey
+   1) "name"
+   2) "redis tutorial"
+   3) "description"
+   4) "redis basic commands for caching"
+   5) "likes"
+   6) "20"
+   7) "visitors"
+   8) "23000"
+   ```
+
+   
 
    哈希对象的底层实现可以是ziplist或者hashtable。
    ziplist中的哈希对象是按照key1,value1,key2,value2这样的顺序存放来存储的。当对象数目不多且内容不大时，这种方式效率是很高的。
@@ -157,6 +193,22 @@ raw和embstr的区别可以用下面两幅图所示：
    　　什么叫渐进式  rehash？也就是说扩容和收缩操作不是一次性、集中式完成的，而是分多次、渐进式完成的。如果保存在Redis中的键值对只有几个几十个，那么  rehash 操作可以瞬间完成，但是如果键值对有几百万，几千万甚至几亿，那么要一次性的进行  rehash，势必会造成Redis一段时间内不能进行别的操作。所以Redis采用渐进式rehash，这样在进行渐进式rehash期间，字典的删除查找更新等操作可能会在两个哈希表上进行，第一个哈希表没有找到，就会去第二个哈希表上进行查找。但是进行 增加操作，一定是在新的哈希表上进行的。
 
 4. set集合对象，相等于java语言中的HashSet。
+
+   ```
+   redis 127.0.0.1:6379> SADD runoobkey redis
+   (integer) 1
+   redis 127.0.0.1:6379> SADD runoobkey mongodb
+   (integer) 1
+   redis 127.0.0.1:6379> SADD runoobkey mysql
+   (integer) 1
+   redis 127.0.0.1:6379> SADD runoobkey mysql
+   (integer) 0
+   redis 127.0.0.1:6379> SMEMBERS runoobkey
+   
+   1) "mysql"
+   2) "mongodb"
+   3) "redis"
+   ```
 
    集合对象的编码可以是intset(当元素都是int 且元素个数小于默认512个)或者hashtable。
    intset是一个整数集合，里面存的为某种同一类型的整数，支持如下三种长度的整数：
@@ -199,10 +251,31 @@ raw和embstr的区别可以用下面两幅图所示：
 
 5. 有序集合
 
+   ```
+   redis 127.0.0.1:6379> ZADD runoobkey 1 redis
+   (integer) 1
+   redis 127.0.0.1:6379> ZADD runoobkey 2 mongodb
+   (integer) 1
+   redis 127.0.0.1:6379> ZADD runoobkey 3 mysql
+   (integer) 1
+   redis 127.0.0.1:6379> ZADD runoobkey 3 mysql
+   (integer) 0
+   redis 127.0.0.1:6379> ZADD runoobkey 4 mysql
+   (integer) 0
+   redis 127.0.0.1:6379> ZRANGE runoobkey 0 10 WITHSCORES
+   
+   1) "redis"
+   2) "1"
+   3) "mongodb"
+   4) "2"
+   5) "mysql"
+   6) "4"
+   ```
+
    有序集合的编码可能两种，一种是ziplist，另一种是skiplist与dict的结合。
    ziplist作为集合和作为哈希对象是一样的，member和score顺序存放。按照score从小到大顺序排列
-   
+
    ![](../images/redis/7.png)
-   
+
    skiplist是一种跳跃表，它实现了有序集合中的快速查找，在大多数情况下它的速度都可以和平衡树差不多。但它的实现比较简单，可以作为平衡树的替代品。它的结构比较特殊。
 
