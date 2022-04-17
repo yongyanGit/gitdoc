@@ -1,11 +1,11 @@
 # RocketMQ内存映射
 
 RocketMQ通过使用内存映射文件来提高IO访问性能，无论是CommitLog、  ConsumeQueue还是IndexFile，单个文件都被设计为固定长度，如果一个文件写满以后再创建一个新文件，文件名就为该文件第一条消息对应的全局物理偏移量。例如CommitLog的文件组织方式如下图所示。
-![](/Users/user/Documents/workSpace/gitdoc/images/mq/49.png)
+![](../images/mq/49.png)
 
 RocketMQ使用 MappedFile、 MappedFileQueue来封装存储文件。 
 
-![](/Users/user/Documents/workSpace/gitdoc/images/mq/50.png)
+![](../images/mq/50.png)
 
 ### MappedFileQueue
 
@@ -89,7 +89,7 @@ FileChannel提供了map方法把文件映射到虚拟内存：
 // 只保留了核心代码
 public MappedByteBuffer map(MapMode mode, long position, long size)  throws IOException {
     // allocationGranularity一般等于64K，它是虚拟内存的分配粒度，由操作系统指定
-    // 这里将position与分配粒度取余，然后真实映射起始位置为mapPosition = position-pagePosition,position 是参数指定的 position，pagePosition是根据内存分配粒度取余的结果，最终算出映射起始地址，这样算是为了内存对齐
+    // 这里将position与分配粒度取余，然后真实映射起始位置为mapPosition = position-pagePosition，pagePosition是根据内存分配粒度取余的结果，position - pagePosition这样算是为了内存对齐
     // 这样无论position为多少，得出的各个MappedByteBuffer实例之间的内存都是成块对齐的
     // 对齐的好处：如果两个不同的MappedByteBuffer，即便它们的position不同，但是只要它们有公共映射区域的话，这些公共区域在物理内存上的分页会被共享
     // 如果它们的MapMode是PRIVATE的话，那么会copy-on-write的方式来对修改内容进行私有化
@@ -184,3 +184,762 @@ MappedByteBuffer使用虚拟内存，因此分配(map)的内存大小不受JVM�
 
 至此，我们已经了解了文件内存映射的技术，既然Java已经提供了内存映射的方案，还有MappedFile什么事呢？这一层封装又有何意义呢？接下来再回到MappedFile的介绍中来，我将详细介绍RocketMQ的MappedFile都对原生内存映射方案做了哪些增强。
 
+### 消息存储
+
+```java
+public PutMessageResult putMessage(final MessageExtBrokerInner msg) {
+    //设置消息存储到文件中的时间
+    msg.setStoreTimestamp(System.currentTimeMillis());
+    //设置消息的校验码CRC
+    msg.setBodyCRC(UtilAll.crc32(msg.getBody()));
+    AppendMessageResult result = null;
+    StoreStatsService storeStatsService = this.defaultMessageStore.getStoreStatsService();
+ 
+    String topic = msg.getTopic();
+    int queueId = msg.getQueueId();
+ 
+    final int tranType = MessageSysFlag.getTransactionValue(msg.getSysFlag());
+    if (tranType == MessageSysFlag.TRANSACTION_NOT_TYPE
+        || tranType == MessageSysFlag.TRANSACTION_COMMIT_TYPE) {
+        // Delay Delivery消息的延迟级别是否大于0
+        if (msg.getDelayTimeLevel() > 0) {
+        	//如果消息的延迟级别大于最大的延迟级别则置为最大延迟级别
+            if (msg.getDelayTimeLevel() > this.defaultMessageStore.getScheduleMessageService().getMaxDelayLevel()) {
+                msg.setDelayTimeLevel(this.defaultMessageStore.getScheduleMessageService().getMaxDelayLevel());
+            }
+            //将消息主题设置为SCHEDULE_TOPIC_XXXX
+            topic = ScheduleMessageService.SCHEDULE_TOPIC;
+            //将消息队列设置为延迟的消息队列的ID
+            queueId = ScheduleMessageService.delayLevel2QueueId(msg.getDelayTimeLevel());
+            //消息的原有的主题和消息队列存入属性中
+            MessageAccessor.putProperty(msg, MessageConst.PROPERTY_REAL_TOPIC, msg.getTopic());
+            MessageAccessor.putProperty(msg, MessageConst.PROPERTY_REAL_QUEUE_ID, String.valueOf(msg.getQueueId()));
+            msg.setPropertiesString(MessageDecoder.messageProperties2String(msg.getProperties()));
+            msg.setTopic(topic);
+            msg.setQueueId(queueId);
+        }
+    }
+ 
+    long eclipseTimeInLock = 0;
+    MappedFile unlockMappedFile = null;
+    //获取最后一个消息的映射文件，mappedFileQueue可看作是CommitLog文件夹下的一个个文件的映射
+    MappedFile mappedFile = this.mappedFileQueue.getLastMappedFile();
+ 
+    //写入消息之前先申请putMessageLock，也就是保证消息写入CommitLog文件中串行的
+    putMessageLock.lock(); //spin or ReentrantLock ,depending on store config
+    try {
+        long beginLockTimestamp = this.defaultMessageStore.getSystemClock().now();
+        this.beginTimeInLock = beginLockTimestamp;
+ 
+        //设置消息的存储时间
+        msg.setStoreTimestamp(beginLockTimestamp);
+        //mappedFile==null标识CommitLog文件还未创建，第一次存消息则创建CommitLog文件
+        //mappedFile.isFull()表示mappedFile文件已满，需要重新创建CommitLog文件
+        if (null == mappedFile || mappedFile.isFull()) {
+        	//里面的参数0代表偏移量
+            mappedFile = this.mappedFileQueue.getLastMappedFile(0); // Mark: NewFile may be cause noise
+        }
+        //mappedFile==null说明创建CommitLog文件失败抛出异常，创建失败可能是磁盘空间不足或者权限不够
+        if (null == mappedFile) {
+            log.error("create mapped file1 error, topic: " + msg.getTopic() + " clientAddr: " + msg.getBornHostString());
+            beginTimeInLock = 0;
+            return new PutMessageResult(PutMessageStatus.CREATE_MAPEDFILE_FAILED, null);
+        }
+        //mappedFile文件后面追加消息
+        result = mappedFile.appendMessage(msg, this.appendMessageCallback);
+        switch (result.getStatus()) {
+            case PUT_OK:
+                break;
+            case END_OF_FILE:
+                unlockMappedFile = mappedFile;
+                // Create a new file, re-write the message
+                mappedFile = this.mappedFileQueue.getLastMappedFile(0);
+                if (null == mappedFile) {
+                    // XXX: warn and notify me
+                    log.error("create mapped file2 error, topic: " + msg.getTopic() + " clientAddr: " + msg.getBornHostString());
+                    beginTimeInLock = 0;
+                    return new PutMessageResult(PutMessageStatus.CREATE_MAPEDFILE_FAILED, result);
+                }
+                result = mappedFile.appendMessage(msg, this.appendMessageCallback);
+                break;
+            case MESSAGE_SIZE_EXCEEDED:
+            case PROPERTIES_SIZE_EXCEEDED:
+                beginTimeInLock = 0;
+                return new PutMessageResult(PutMessageStatus.MESSAGE_ILLEGAL, result);
+            case UNKNOWN_ERROR:
+                beginTimeInLock = 0;
+                return new PutMessageResult(PutMessageStatus.UNKNOWN_ERROR, result);
+            default:
+                beginTimeInLock = 0;
+                return new PutMessageResult(PutMessageStatus.UNKNOWN_ERROR, result);
+        }
+ 
+        eclipseTimeInLock = this.defaultMessageStore.getSystemClock().now() - beginLockTimestamp;
+        beginTimeInLock = 0;
+    } finally {
+    	//释放锁
+        putMessageLock.unlock();
+    }
+ 
+    if (eclipseTimeInLock > 500) {
+        log.warn("[NOTIFYME]putMessage in lock cost time(ms)={}, bodyLength={} AppendMessageResult={}", eclipseTimeInLock, msg.getBody().length, result);
+    }
+ 
+    if (null != unlockMappedFile && this.defaultMessageStore.getMessageStoreConfig().isWarmMapedFileEnable()) {
+        this.defaultMessageStore.unlockMappedFile(unlockMappedFile);
+    }
+ 
+    PutMessageResult putMessageResult = new PutMessageResult(PutMessageStatus.PUT_OK, result);
+ 
+    // Statistics
+    storeStatsService.getSinglePutMessageTopicTimesTotal(msg.getTopic()).incrementAndGet();
+    storeStatsService.getSinglePutMessageTopicSizeTotal(topic).addAndGet(result.getWroteBytes());
+    //消息刷盘
+    handleDiskFlush(result, putMessageResult, msg);
+    //主从数据同步复制
+    handleHA(result, putMessageResult, msg);
+    return putMessageResult;
+}
+```
+
+本章节我们重点分析三点，关于刷盘机制后面章节会介绍
+
+1. 获取映射文件MappedFile
+2. 创建映射文件MappedFile
+3. 映射文件中写入消息
+
+# 2、获取映射文件MappedFile
+
+## 2.1、MappedFile和Commitlog的关系
+
+每个MappedFile对象对于一个Commitlog文件，我们分析下这个对应关系的业务操作发生在什么时候，我们分析下[源码](https://so.csdn.net/so/search?q=源码&spm=1001.2101.3001.7020)。
+
+Broker服务启动时会创建BrokerController对象并对其初始化initialize()该方法调用DefaultMessageStore.load()方法加载Commitlog文件和消费队列文。
+
+```java
+public boolean load() {
+    //省略代码...
+    // 加载Commitlog文件
+    result = result && this.commitLog.load();
+    // 加载消费队列文件
+    result = result && this.loadConsumeQueue();
+    //省略代码...
+}
+```
+
+我们分析下commitLog.load()调用mappedFileQueue.load()
+
+```java
+public boolean load() {
+	//消息存储路径
+    File dir = new File(this.storePath);
+    File[] files = dir.listFiles();
+    if (files != null) {
+        // 升序
+        Arrays.sort(files);
+        for (File file : files) {
+            if (file.length() != this.mappedFileSize) {
+                log.warn(file + "\t" + file.length()
+                    + " length not matched message store config value, ignore it");
+                return true;
+            }
+            try {
+                MappedFile mappedFile = new MappedFile(file.getPath(), mappedFileSize);
+                //当前文件的写指针
+                mappedFile.setWrotePosition(this.mappedFileSize);
+                //刷写到磁盘指针，该指针之前的数据持久化到磁盘中
+                mappedFile.setFlushedPosition(this.mappedFileSize);
+                //当前文件的提交指针
+                mappedFile.setCommittedPosition(this.mappedFileSize);
+                //添加到MappedFile文件集合中
+                this.mappedFiles.add(mappedFile);
+                log.info("load " + file.getPath() + " OK");
+            } catch (IOException e) {
+                log.error("load file " + file + " error", e);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+```
+
+很明显此方法就是MappedFile对象和一个Commitlog文件建立的逻辑关系
+
+循环消息存储路径文件夹中的Commitlog文件，升序排列，创建MappedFile对象设置基础参数数据，添加到MappedFile文件集合中,我们查看new MappedFile(),调用MappedFile.init()方法
+
+```java
+private void init(final String fileName, final int fileSize) throws IOException {
+    this.fileName = fileName;
+    this.fileSize = fileSize;
+    this.file = new File(fileName);
+    //初始化的初始偏移量是文件名称
+    this.fileFromOffset = Long.parseLong(this.file.getName());
+    boolean ok = false;
+    ensureDirOK(this.file.getParent());
+    try {
+    	//创建读写文件通道NIO
+        this.fileChannel = new RandomAccessFile(this.file, "rw").getChannel();
+        //将文件映射到内存
+        this.mappedByteBuffer = this.fileChannel.map(MapMode.READ_WRITE, 0, fileSize);
+        TOTAL_MAPPED_VIRTUAL_MEMORY.addAndGet(fileSize);
+        TOTAL_MAPPED_FILES.incrementAndGet();
+        ok = true;
+    } catch (FileNotFoundException e) {
+        log.error("create file channel " + this.fileName + " Failed. ", e);
+        throw e;
+    } catch (IOException e) {
+        log.error("map file " + this.fileName + " Failed. ", e);
+        throw e;
+    } finally {
+        if (!ok && this.fileChannel != null) {
+            this.fileChannel.close();
+        }
+    }
+}
+```
+
+将文件映射到内存。
+
+上面我们分析了mappedFile和commitlog的逻辑建立关系，将mappedFile加入mappedFileQueue中，并讲解了MappedFile初始化的过程。
+
+## 2.2、获取mappedFileQueue中最后一个mappedFile
+
+上面我们了解到commitlog和mappedFile一一对应的关系，我们需要存储消息就需要找到最后一个未存满消息的commitlog文件，即查找的是最后一个mappedFiled对象
+
+```java
+public MappedFile getLastMappedFile() {
+    MappedFile mappedFileLast = null;
+ 
+    while (!this.mappedFiles.isEmpty()) {
+        try {
+            mappedFileLast = this.mappedFiles.get(this.mappedFiles.size() - 1);
+            break;
+        } catch (IndexOutOfBoundsException e) {
+            //continue;
+        } catch (Exception e) {
+            log.error("getLastMappedFile has exception.", e);
+            break;
+        }
+    }
+ 
+    return mappedFileLast;
+}
+```
+
+# 3、创建映射文件MappedFile
+
+当获取的MappedFile对象不存在或者消息已经存满我们需要创建,this.mappedFileQueue.getLastMappedFile(0)
+
+```java
+public MappedFile getLastMappedFile(final long startOffset, boolean needCreate) {
+	//创建映射问价的起始偏移量
+    long createOffset = -1;
+    //获取最后一个映射文件，如果为null或者写满则会执行创建逻辑
+    MappedFile mappedFileLast = getLastMappedFile();
+    //最后一个映射文件为null,创建一个新的映射文件
+    if (mappedFileLast == null) {
+    	//计算将要创建的映射文件的起始偏移量
+    	//如果startOffset<=mappedFileSize则起始偏移量为0
+    	//如果startOffset>mappedFileSize则起始偏移量为是mappedFileSize的倍数
+        createOffset = startOffset - (startOffset % this.mappedFileSize);
+    }
+    //映射文件满了，创建新的映射文件
+    if (mappedFileLast != null && mappedFileLast.isFull()) {
+    	//创建的映射文件的偏移量等于最后一个映射文件的起始偏移量  + 映射文件的大小（commitlog文件大小）
+        createOffset = mappedFileLast.getFileFromOffset() + this.mappedFileSize;
+    }
+    //创建新的映射文件
+    if (createOffset != -1 && needCreate) {
+    	//构造commitlog名称
+        String nextFilePath = this.storePath + File.separator + UtilAll.offset2FileName(createOffset);
+        String nextNextFilePath = this.storePath + File.separator
+            + UtilAll.offset2FileName(createOffset + this.mappedFileSize);
+        MappedFile mappedFile = null;
+        //优先通过allocateMappedFileService中方式构建映射文件，预分配方式，性能高
+        //如果上述方式失败则通过new创建映射文件
+        if (this.allocateMappedFileService != null) {
+            mappedFile = this.allocateMappedFileService.putRequestAndReturnMappedFile(nextFilePath,
+                nextNextFilePath, this.mappedFileSize);
+        } else {
+            try {
+                mappedFile = new MappedFile(nextFilePath, this.mappedFileSize);
+            } catch (IOException e) {
+                log.error("create mappedFile exception", e);
+            }
+        }
+        if (mappedFile != null) {
+            if (this.mappedFiles.isEmpty()) {
+                mappedFile.setFirstCreateInQueue(true);
+            }
+            this.mappedFiles.add(mappedFile);
+        }
+        return mappedFile;
+    }
+    return mappedFileLast;
+}
+```
+
+AllocateMappedFileService是创建MappedFile核心类，我们分析下该类
+
+| 字段         | 类型                                   | 说明                                                         |
+| ------------ | -------------------------------------- | ------------------------------------------------------------ |
+| waitTimeOut  | int                                    | 等待创建映射文件的超时时间，默认5秒                          |
+| requestTable | ConcurrentMap<String, AllocateRequest> | 用来保存当前所有待处理的分配请求，其中KEY是filePath,VALUE是分配请求。如果分配请求被成功处理，即获取到映射文件则从请求会从requestTable中移除 |
+| requestQueue | PriorityBlockingQueue<AllocateRequest> | 分配请求队列，注意是优先级队列，从该队列中获取请求，进而根据请求创建映射文件 |
+| hasException | boolean                                | 标识是否发生异常                                             |
+| messageStore | DefaultMessageStore                    |                                                              |
+
+```java
+public MappedFile putRequestAndReturnMappedFile(String nextFilePath, String nextNextFilePath, int fileSize) {
+    //默认提交两个请求
+	int canSubmitRequests = 2;
+	//当transientStorePoolEnable为true，刷盘方式是ASYNC_FLUSH，broker不是SLAVE，才启动TransientStorePool
+    if (this.messageStore.getMessageStoreConfig().isTransientStorePoolEnable()) {
+    	//启动快速失败策略时，计算TransientStorePool中剩余的buffer数量减去requestQueue中待分配的数量后，剩余的buffer数量
+        if (this.messageStore.getMessageStoreConfig().isFastFailIfNoBufferInStorePool()
+            && BrokerRole.SLAVE != this.messageStore.getMessageStoreConfig().getBrokerRole()) { //if broker is slave, don't fast fail even no buffer in pool
+            canSubmitRequests = this.messageStore.getTransientStorePool().remainBufferNumbs() - this.requestQueue.size();
+        }
+    }
+    
+    AllocateRequest nextReq = new AllocateRequest(nextFilePath, fileSize);
+    //判断requestTable中是否存在该路径的分配请求，如果存在则说明该请求已经在排队中
+    boolean nextPutOK = this.requestTable.putIfAbsent(nextFilePath, nextReq) == null;
+    
+    //该路径没有在排队
+    if (nextPutOK) {
+    	//如果剩余的buffer数量小于等于0则快速失败
+        if (canSubmitRequests <= 0) {
+            log.warn("[NOTIFYME]TransientStorePool is not enough, so create mapped file error, " +
+                "RequestQueueSize : {}, StorePoolSize: {}", this.requestQueue.size(), this.messageStore.getTransientStorePool().remainBufferNumbs());
+            this.requestTable.remove(nextFilePath);
+            return null;
+        }
+        //将指定的元素插入到此优先级队列中
+        boolean offerOK = this.requestQueue.offer(nextReq);
+        if (!offerOK) {
+            log.warn("never expected here, add a request to preallocate queue failed");
+        }
+        //剩余的buffer数量减1
+        canSubmitRequests--;
+    }
+    
+    //创建第二个映射文件
+    AllocateRequest nextNextReq = new AllocateRequest(nextNextFilePath, fileSize);
+    boolean nextNextPutOK = this.requestTable.putIfAbsent(nextNextFilePath, nextNextReq) == null;
+    if (nextNextPutOK) {
+    	//检查buffer数量
+        if (canSubmitRequests <= 0) {
+            log.warn("[NOTIFYME]TransientStorePool is not enough, so skip preallocate mapped file, " +
+                "RequestQueueSize : {}, StorePoolSize: {}", this.requestQueue.size(), this.messageStore.getTransientStorePool().remainBufferNumbs());
+            this.requestTable.remove(nextNextFilePath);
+        } else {
+        	//将指定的元素插入到此优先级队列中
+            boolean offerOK = this.requestQueue.offer(nextNextReq);
+            if (!offerOK) {
+                log.warn("never expected here, add a request to preallocate queue failed");
+            }
+        }
+    }
+    if (hasException) {
+        log.warn(this.getServiceName() + " service has exception. so return null");
+        return null;
+    }
+    AllocateRequest result = this.requestTable.get(nextFilePath);
+    try {
+        if (result != null) {
+        	//等待
+            boolean waitOK = result.getCountDownLatch().await(waitTimeOut, TimeUnit.MILLISECONDS);
+            if (!waitOK) {
+                log.warn("create mmap timeout " + result.getFilePath() + " " + result.getFileSize());
+                return null;
+            } else {
+                this.requestTable.remove(nextFilePath);
+                return result.getMappedFile();
+            }
+        } else {
+            log.error("find preallocate mmap failed, this never happen");
+        }
+    } catch (InterruptedException e) {
+        log.warn(this.getServiceName() + " service has exception. ", e);
+    }
+    return null;
+}
+```
+
+将创建请求插入到requestQueue和requestTable中，由于优先级队列中requestQueue存入的是AllocateRequest对象实现了compareTo方法，优先级的排序，由于创建MappedFile时传入的是预创建两个，我们需要创建最新的请求的结果，其他请求需要进行排队。
+
+AllocateMappedFileService是个多线程类，内部实现了run()的核心方法mmapOperation()
+
+```java
+private boolean mmapOperation() {
+    boolean isSuccess = false;
+    AllocateRequest req = null;
+    try {
+    	//检索并删除此队列的头，如有必要，等待元素可用
+        req = this.requestQueue.take();
+        //
+        AllocateRequest expectedRequest = this.requestTable.get(req.getFilePath());
+        if (null == expectedRequest) {
+            log.warn("this mmap request expired, maybe cause timeout " + req.getFilePath() + " "
+                + req.getFileSize());
+            return true;
+        }
+        if (expectedRequest != req) {
+            log.warn("never expected here,  maybe cause timeout " + req.getFilePath() + " "
+                + req.getFileSize() + ", req:" + req + ", expectedRequest:" + expectedRequest);
+            return true;
+        }
+ 
+        if (req.getMappedFile() == null) {
+            long beginTime = System.currentTimeMillis();
+ 
+            MappedFile mappedFile;
+            //判断TransientStorePoolEnable是否启用
+            if (messageStore.getMessageStoreConfig().isTransientStorePoolEnable()) {
+                try {
+                    mappedFile = ServiceLoader.load(MappedFile.class).iterator().next();
+                    mappedFile.init(req.getFilePath(), req.getFileSize(), messageStore.getTransientStorePool());
+                } catch (RuntimeException e) {//默认方式创建
+                    log.warn("Use default implementation.");
+                    mappedFile = new MappedFile(req.getFilePath(), req.getFileSize(), messageStore.getTransientStorePool());
+                }
+            } else {
+                mappedFile = new MappedFile(req.getFilePath(), req.getFileSize());
+            }
+ 
+            long eclipseTime = UtilAll.computeEclipseTimeMilliseconds(beginTime);
+            if (eclipseTime > 10) {
+                int queueSize = this.requestQueue.size();
+                log.warn("create mappedFile spent time(ms) " + eclipseTime + " queue size " + queueSize
+                    + " " + req.getFilePath() + " " + req.getFileSize());
+            }
+ 
+            // pre write mappedFile
+            if (mappedFile.getFileSize() >= this.messageStore.getMessageStoreConfig().getMapedFileSizeCommitLog()
+                && this.messageStore.getMessageStoreConfig().isWarmMapedFileEnable()) {
+            	//对MappedFile进行预热
+                mappedFile.warmMappedFile(this.messageStore.getMessageStoreConfig().getFlushDiskType(),
+                    this.messageStore.getMessageStoreConfig().getFlushLeastPagesWhenWarmMapedFile());
+            }
+ 
+            req.setMappedFile(mappedFile);
+            this.hasException = false;
+            isSuccess = true;
+        }
+    } catch (InterruptedException e) {
+        log.warn(this.getServiceName() + " interrupted, possibly by shutdown.");
+        this.hasException = true;
+        return false;
+    } catch (IOException e) {
+        log.warn(this.getServiceName() + " service has exception. ", e);
+        this.hasException = true;
+        if (null != req) {
+            requestQueue.offer(req);
+            try {
+                Thread.sleep(1);
+            } catch (InterruptedException ignored) {
+            }
+        }
+    } finally {
+        if (req != null && isSuccess)
+            req.getCountDownLatch().countDown();
+    }
+    return true;
+}
+```
+
+我们发现有两种方式创建mappedFile对象
+
+1、mappedFile = new MappedFile(req.getFilePath(), req.getFileSize())
+
+```java
+public MappedFile(final String fileName, final int fileSize) throws IOException {
+    init(fileName, fileSize);
+}
+private void init(final String fileName, final int fileSize) throws IOException {
+    this.fileName = fileName;
+    this.fileSize = fileSize;
+    this.file = new File(fileName);
+    //初始化的初始偏移量是文件名称
+    this.fileFromOffset = Long.parseLong(this.file.getName());
+    boolean ok = false;
+    ensureDirOK(this.file.getParent());
+    try {
+    	//创建读写文件通道NIO
+        this.fileChannel = new RandomAccessFile(this.file, "rw").getChannel();
+        //将文件映射到内存
+        this.mappedByteBuffer = this.fileChannel.map(MapMode.READ_WRITE, 0, fileSize);
+        TOTAL_MAPPED_VIRTUAL_MEMORY.addAndGet(fileSize);
+        TOTAL_MAPPED_FILES.incrementAndGet();
+        ok = true;
+    } catch (FileNotFoundException e) {
+        log.error("create file channel " + this.fileName + " Failed. ", e);
+        throw e;
+    } catch (IOException e) {
+        log.error("map file " + this.fileName + " Failed. ", e);
+        throw e;
+    } finally {
+        if (!ok && this.fileChannel != null) {
+            this.fileChannel.close();
+        }
+    }
+}
+```
+
+2、mappedFile = ServiceLoader.load(MappedFile.class).iterator().next();  mappedFile.init(req.getFilePath(), req.getFileSize(),  messageStore.getTransientStorePool())
+
+```java
+//transientStorePoolEnable 为 true
+public void init(final String fileName, final int fileSize,
+    final TransientStorePool transientStorePool) throws IOException {
+    init(fileName, fileSize);
+    //初始化MappedFile的writeBuffer
+    this.writeBuffer = transientStorePool.borrowBuffer();
+    this.transientStorePool = transientStorePool;
+}
+```
+
+> TransientStorePool与MappedFile在数据处理上的差异在什么地方呢？分析其代码，TransientStorePool会通过ByteBuffer.allocateDirect调用直接申请对外内存，消息数据在写入内存的时候是写入预申请的内存中。在异步刷盘的时候，再由刷盘线程将这些内存中的修改写入文件。
+>
+> 那么与直接使用MappedByteBuffer相比差别在什么地方呢？修改MappedByteBuffer实际会将数据写入文件对应的Page  Cache中，而TransientStorePool方案下写入的则为纯粹的内存。因此在消息写入操作上会更快，因此能更少的占用CommitLog.putMessageLock锁，从而能够提升消息处理量。使用TransientStorePool方案的缺陷主要在于在异常崩溃的情况下回丢失更多的消息。
+
+创建完mappedFile对象后，有个预热操作，每个字节填充**(byte) 0**
+
+```java
+public void warmMappedFile(FlushDiskType type, int pages) {
+    long beginTime = System.currentTimeMillis();
+    //创建一个新的字节缓冲区，其内容是此缓冲区内容的共享子序列
+    ByteBuffer byteBuffer = this.mappedByteBuffer.slice();
+    //记录上一次刷盘的字节数
+    int flush = 0;
+    long time = System.currentTimeMillis();
+    for (int i = 0, j = 0; i < this.fileSize; i += MappedFile.OS_PAGE_SIZE, j++) {
+        byteBuffer.put(i, (byte) 0);
+        // 刷盘方式是同步策略时，进行刷盘操作
+        // 每修改pages个分页刷一次盘，相当于4096*4k = 16M  每16M刷一次盘，1G文件 1024M/16M = 64次
+        if (type == FlushDiskType.SYNC_FLUSH) {
+            if ((i / OS_PAGE_SIZE) - (flush / OS_PAGE_SIZE) >= pages) {
+                flush = i;
+                mappedByteBuffer.force();
+            }
+        }
+ 
+        // 防止垃圾回收GC
+        if (j % 1000 == 0) {
+            log.info("j={}, costTime={}", j, System.currentTimeMillis() - time);
+            time = System.currentTimeMillis();
+            try {
+                Thread.sleep(0);
+            } catch (InterruptedException e) {
+                log.error("Interrupted", e);
+            }
+        }
+    }
+    // force flush when prepare load finished
+    if (type == FlushDiskType.SYNC_FLUSH) {
+        log.info("mapped file warm-up done, force to disk, mappedFile={}, costTime={}",
+            this.getFileName(), System.currentTimeMillis() - beginTime);
+        //刷盘，强制将此缓冲区内容的任何更改写入包含映射文件的存储设备
+        mappedByteBuffer.force();
+    }
+    log.info("mapped file warm-up done. mappedFile={}, costTime={}", this.getFileName(),
+        System.currentTimeMillis() - beginTime);
+    
+    this.mlock();
+}
+```
+
+# 4、映射文件中写入消息
+
+MappedFile.appendMessage()的核心方法MappedFile.appendMessagesInner()
+
+```java
+public AppendMessageResult appendMessagesInner(final MessageExt messageExt, final AppendMessageCallback cb) {
+    assert messageExt != null;
+    assert cb != null;
+    //获取当前写的指针
+    int currentPos = this.wrotePosition.get();
+ 
+    if (currentPos < this.fileSize) {
+    	//创建一个与MappedFile的共享内存区
+        ByteBuffer byteBuffer = writeBuffer != null ? writeBuffer.slice() : this.mappedByteBuffer.slice();
+        //设置指针
+        byteBuffer.position(currentPos);
+        AppendMessageResult result = null;
+        if (messageExt instanceof MessageExtBrokerInner) {
+            result = cb.doAppend(this.getFileFromOffset(), byteBuffer, this.fileSize - currentPos, (MessageExtBrokerInner) messageExt);
+        } else if (messageExt instanceof MessageExtBatch) {
+            result = cb.doAppend(this.getFileFromOffset(), byteBuffer, this.fileSize - currentPos, (MessageExtBatch) messageExt);
+        } else {
+            return new AppendMessageResult(AppendMessageStatus.UNKNOWN_ERROR);
+        }
+        this.wrotePosition.addAndGet(result.getWroteBytes());
+        this.storeTimestamp = result.getStoreTimestamp();
+        return result;
+    }
+    //当前写的指针大于文件的大小则抛出异常
+    log.error("MappedFile.appendMessage return null, wrotePosition: {} fileSize: {}", currentPos, this.fileSize);
+    return new AppendMessageResult(AppendMessageStatus.UNKNOWN_ERROR);
+}
+```
+
+追加消息的核心方法Commotlog.doAppend()
+
+```java
+public AppendMessageResult doAppend(final long fileFromOffset, final ByteBuffer byteBuffer, final int maxBlank,
+    final MessageExtBrokerInner msgInner) {
+    // STORETIMESTAMP + STOREHOSTADDRESS + OFFSET <br>
+ 
+    // PHY OFFSET
+	//写入的位置
+    long wroteOffset = fileFromOffset + byteBuffer.position();
+ 
+    this.resetByteBuffer(hostHolder, 8);
+    //创建全局唯一的消息ID，消息ID有16字节，4个字节IP+4个字节的端口号+8字节的消息偏移量
+    String msgId = MessageDecoder.createMessageId(this.msgIdMemory, msgInner.getStoreHostBytes(hostHolder), wroteOffset);
+ 
+    // Record ConsumeQueue information
+    keyBuilder.setLength(0);
+    keyBuilder.append(msgInner.getTopic());
+    keyBuilder.append('-');
+    keyBuilder.append(msgInner.getQueueId());
+    String key = keyBuilder.toString();
+    //从CommitLog中保存了主题和队列的组合      待写入的偏移量
+    Long queueOffset = CommitLog.this.topicQueueTable.get(key);
+    //可能是第一次还没有偏移量设置为0
+    if (null == queueOffset) {
+        queueOffset = 0L;
+        CommitLog.this.topicQueueTable.put(key, queueOffset);
+    }
+ 
+    // Transaction messages that require special handling
+    final int tranType = MessageSysFlag.getTransactionValue(msgInner.getSysFlag());
+    switch (tranType) {
+        // Prepared and Rollback message is not consumed, will not enter the
+        // consumer queuec
+        case MessageSysFlag.TRANSACTION_PREPARED_TYPE:
+        case MessageSysFlag.TRANSACTION_ROLLBACK_TYPE:
+            queueOffset = 0L;
+            break;
+        case MessageSysFlag.TRANSACTION_NOT_TYPE:
+        case MessageSysFlag.TRANSACTION_COMMIT_TYPE:
+        default:
+            break;
+    }
+ 
+    /**
+     * Serialize message
+     */
+    final byte[] propertiesData =
+        msgInner.getPropertiesString() == null ? null : msgInner.getPropertiesString().getBytes(MessageDecoder.CHARSET_UTF8);
+ 
+    final int propertiesLength = propertiesData == null ? 0 : propertiesData.length;
+ 
+    if (propertiesLength > Short.MAX_VALUE) {
+        log.warn("putMessage message properties length too long. length={}", propertiesData.length);
+        return new AppendMessageResult(AppendMessageStatus.PROPERTIES_SIZE_EXCEEDED);
+    }
+ 
+    final byte[] topicData = msgInner.getTopic().getBytes(MessageDecoder.CHARSET_UTF8);
+    final int topicLength = topicData.length;
+ 
+    final int bodyLength = msgInner.getBody() == null ? 0 : msgInner.getBody().length;
+    //计算：消息长度 = 消息体的长度+消息主题的长度 +消息属性的长度
+    final int msgLen = calMsgLength(bodyLength, topicLength, propertiesLength);
+ 
+    // Exceeds the maximum message
+   
+    if (msgLen > this.maxMessageSize) {
+        CommitLog.log.warn("message size exceeded, msg total size: " + msgLen + ", msg body size: " + bodyLength
+            + ", maxMessageSize: " + this.maxMessageSize);
+        return new AppendMessageResult(AppendMessageStatus.MESSAGE_SIZE_EXCEEDED);
+    }
+    //如果消息的长度+END_FILE_MIN_BLANK_LENGTH大于剩余的空闲长度
+    // Determines whether there is sufficient free space
+    //每一个CommitLog文件至少会空闲8个字节，前4位记录当前文件剩余空间，后四位存储魔数（CommitLog.MESSAGE_MAGIC_CODE）
+    if ((msgLen + END_FILE_MIN_BLANK_LENGTH) > maxBlank) {
+        this.resetByteBuffer(this.msgStoreItemMemory, maxBlank);
+        // 1 TOTALSIZE
+        this.msgStoreItemMemory.putInt(maxBlank);
+        // 2 MAGICCODE
+        this.msgStoreItemMemory.putInt(CommitLog.BLANK_MAGIC_CODE);
+        // 3 The remaining space may be any value
+        // Here the length of the specially set maxBlank
+        final long beginTimeMills = CommitLog.this.defaultMessageStore.now();
+        byteBuffer.put(this.msgStoreItemMemory.array(), 0, maxBlank);
+        return new AppendMessageResult(AppendMessageStatus.END_OF_FILE, wroteOffset, maxBlank, msgId, msgInner.getStoreTimestamp(),
+            queueOffset, CommitLog.this.defaultMessageStore.now() - beginTimeMills);
+    }
+ 
+    // Initialization of storage space
+    this.resetByteBuffer(msgStoreItemMemory, msgLen);
+    // 1 TOTALSIZE 该消息条目的总长度，4字节
+    this.msgStoreItemMemory.putInt(msgLen);
+    // 2 MAGICCODE 魔数 ，4字节
+    this.msgStoreItemMemory.putInt(CommitLog.MESSAGE_MAGIC_CODE);
+    // 3 BODYCRC 消息体crc校验码 4字节
+    this.msgStoreItemMemory.putInt(msgInner.getBodyCRC());
+    // 4 QUEUEID 消息消费队列的ID 4字节
+    this.msgStoreItemMemory.putInt(msgInner.getQueueId());
+    // 5 FLAG
+    this.msgStoreItemMemory.putInt(msgInner.getFlag());
+    // 6 QUEUEOFFSET 消息在消息消费队列的偏移量，8字节
+    this.msgStoreItemMemory.putLong(queueOffset);
+    // 7 PHYSICALOFFSET 消息在CommitLog文件中的偏移量 8字节
+    this.msgStoreItemMemory.putLong(fileFromOffset + byteBuffer.position());
+    // 8 SYSFLAG
+    this.msgStoreItemMemory.putInt(msgInner.getSysFlag());
+    // 9 BORNTIMESTAMP 消息生产者调用消息发送的API的时间戳 8字节
+    this.msgStoreItemMemory.putLong(msgInner.getBornTimestamp());
+    // 10 BORNHOST  消息发送者的ip、端口号 8字节
+    this.resetByteBuffer(hostHolder, 8);
+    this.msgStoreItemMemory.put(msgInner.getBornHostBytes(hostHolder));
+    // 11 STORETIMESTAMP  消息存储时间戳，8字节
+    this.msgStoreItemMemory.putLong(msgInner.getStoreTimestamp());
+    // 12 STOREHOSTADDRESS  broker服务器的IP+端口号 8字节
+    this.resetByteBuffer(hostHolder, 8);
+    this.msgStoreItemMemory.put(msgInner.getStoreHostBytes(hostHolder));
+    //this.msgBatchMemory.put(msgInner.getStoreHostBytes());
+    // 13 RECONSUMETIMES 消息重试的次数，4字节
+    this.msgStoreItemMemory.putInt(msgInner.getReconsumeTimes());
+    // 14 Prepared Transaction Offset 事务消息物理偏移量，8字节
+    this.msgStoreItemMemory.putLong(msgInner.getPreparedTransactionOffset());
+    // 15 BODY 消息体内容，bodyLength的长度
+    this.msgStoreItemMemory.putInt(bodyLength);
+    if (bodyLength > 0)
+        this.msgStoreItemMemory.put(msgInner.getBody());
+    // 16 TOPIC 主题
+    this.msgStoreItemMemory.put((byte) topicLength);
+    this.msgStoreItemMemory.put(topicData);
+    // 17 PROPERTIES 消息属性
+    this.msgStoreItemMemory.putShort((short) propertiesLength);
+    if (propertiesLength > 0)
+        this.msgStoreItemMemory.put(propertiesData);
+ 
+    final long beginTimeMills = CommitLog.this.defaultMessageStore.now();
+    // Write messages to the queue buffer
+    //写到消息队列缓存中
+    byteBuffer.put(this.msgStoreItemMemory.array(), 0, msgLen);
+ 
+    AppendMessageResult result = new AppendMessageResult(AppendMessageStatus.PUT_OK, wroteOffset, msgLen, msgId,
+        msgInner.getStoreTimestamp(), queueOffset, CommitLog.this.defaultMessageStore.now() - beginTimeMills);
+ 
+    switch (tranType) {
+        case MessageSysFlag.TRANSACTION_PREPARED_TYPE:
+        case MessageSysFlag.TRANSACTION_ROLLBACK_TYPE:
+            break;
+        case MessageSysFlag.TRANSACTION_NOT_TYPE:
+        case MessageSysFlag.TRANSACTION_COMMIT_TYPE:
+            // The next update ConsumeQueue information
+            CommitLog.this.topicQueueTable.put(key, ++queueOffset);
+            break;
+        default:
+            break;
+    }
+    return result;
+}
+```
+
+构建消息的基础参数，返回放入缓存的状态及写指针的位置。
