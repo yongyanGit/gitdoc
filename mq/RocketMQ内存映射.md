@@ -187,6 +187,7 @@ MappedByteBuffer使用虚拟内存，因此分配(map)的内存大小不受JVM�
 ### 消息存储
 
 ```java
+//CommitLog
 public PutMessageResult putMessage(final MessageExtBrokerInner msg) {
     //设置消息存储到文件中的时间
     msg.setStoreTimestamp(System.currentTimeMillis());
@@ -306,11 +307,16 @@ public PutMessageResult putMessage(final MessageExtBrokerInner msg) {
 
 ## 2.1、MappedFile和Commitlog的关系
 
-每个MappedFile对象对于一个Commitlog文件，我们分析下这个对应关系的业务操作发生在什么时候，我们分析下[源码](https://so.csdn.net/so/search?q=源码&spm=1001.2101.3001.7020)。
-
-Broker服务启动时会创建BrokerController对象并对其初始化initialize()该方法调用DefaultMessageStore.load()方法加载Commitlog文件和消费队列文。
+每个MappedFile对象对于一个Commitlog文件，Broker服务启动时会创建BrokerController对象并在其初始化initialize()中调用DefaultMessageStore的load()方法加载Commitlog文件和消费队列。
 
 ```java
+ public boolean initialize() throws CloneNotSupportedException {
+     this.messageStore =
+                    new DefaultMessageStore(this.messageStoreConfig, this.brokerStatsManager, this.messageArrivingListener,
+                        this.brokerConfig);
+      result = result && this.messageStore.load();
+ }
+
 public boolean load() {
     //省略代码...
     // 加载Commitlog文件
@@ -321,9 +327,17 @@ public boolean load() {
 }
 ```
 
-我们分析下commitLog.load()调用mappedFileQueue.load()
+commitLog.load()方法：
 
 ```java
+public boolean load() {
+        boolean result = this.mappedFileQueue.load();
+        log.info("load commit log " + (result ? "OK" : "Failed"));
+        return result;
+    
+}
+
+//this.mappedFileQueue.load()
 public boolean load() {
 	//消息存储路径
     File dir = new File(this.storePath);
@@ -358,9 +372,9 @@ public boolean load() {
 }
 ```
 
-很明显此方法就是MappedFile对象和一个Commitlog文件建立的逻辑关系
+很明显此方法就是MappedFile对象和一个Commitlog文件建立的逻辑关系，循环消息存储路径文件夹中的Commitlog文件，升序排列，创建MappedFile对象设置基础参数数据，添加到MappedFile文件集合中。
 
-循环消息存储路径文件夹中的Commitlog文件，升序排列，创建MappedFile对象设置基础参数数据，添加到MappedFile文件集合中,我们查看new MappedFile(),调用MappedFile.init()方法
+ 创建MappedFile对象时，会调用它的init()方法：
 
 ```java
 private void init(final String fileName, final int fileSize) throws IOException {
@@ -393,9 +407,7 @@ private void init(final String fileName, final int fileSize) throws IOException 
 }
 ```
 
-将文件映射到内存。
-
-上面我们分析了mappedFile和commitlog的逻辑建立关系，将mappedFile加入mappedFileQueue中，并讲解了MappedFile初始化的过程。
+上面我们分析了mappedFile和commitlog的逻辑建立关系，将mappedFile加入mappedFileQueue中，最后将本地文件与fileChannel建立连接并映射到内存。
 
 ## 2.2、获取mappedFileQueue中最后一个mappedFile
 
@@ -423,7 +435,7 @@ public MappedFile getLastMappedFile() {
 
 # 3、创建映射文件MappedFile
 
-当获取的MappedFile对象不存在或者消息已经存满我们需要创建,this.mappedFileQueue.getLastMappedFile(0)
+当获取的MappedFile对象不存在或者消息已经存满我们需要创建，调用this.mappedFileQueue.getLastMappedFile(0)来创建新的文件。
 
 ```java
 public MappedFile getLastMappedFile(final long startOffset, boolean needCreate) {
@@ -436,6 +448,7 @@ public MappedFile getLastMappedFile(final long startOffset, boolean needCreate) 
     	//计算将要创建的映射文件的起始偏移量
     	//如果startOffset<=mappedFileSize则起始偏移量为0
     	//如果startOffset>mappedFileSize则起始偏移量为是mappedFileSize的倍数
+        //为了内存对齐
         createOffset = startOffset - (startOffset % this.mappedFileSize);
     }
     //映射文件满了，创建新的映射文件
@@ -447,6 +460,7 @@ public MappedFile getLastMappedFile(final long startOffset, boolean needCreate) 
     if (createOffset != -1 && needCreate) {
     	//构造commitlog名称
         String nextFilePath = this.storePath + File.separator + UtilAll.offset2FileName(createOffset);
+        //第二个文件的名称
         String nextNextFilePath = this.storePath + File.separator
             + UtilAll.offset2FileName(createOffset + this.mappedFileSize);
         MappedFile mappedFile = null;
@@ -474,7 +488,7 @@ public MappedFile getLastMappedFile(final long startOffset, boolean needCreate) 
 }
 ```
 
-AllocateMappedFileService是创建MappedFile核心类，我们分析下该类
+AllocateMappedFileService 是创建MappedFile核心类，我们分析下该类
 
 | 字段         | 类型                                   | 说明                                                         |
 | ------------ | -------------------------------------- | ------------------------------------------------------------ |
@@ -488,11 +502,12 @@ AllocateMappedFileService是创建MappedFile核心类，我们分析下该类
 public MappedFile putRequestAndReturnMappedFile(String nextFilePath, String nextNextFilePath, int fileSize) {
     //默认提交两个请求
 	int canSubmitRequests = 2;
-	//当transientStorePoolEnable为true，刷盘方式是ASYNC_FLUSH，broker不是SLAVE，才启动TransientStorePool
+	//当transientStorePoolEnable为true(堆外内存)，刷盘方式是ASYNC_FLUSH，broker不是SLAVE，才启动TransientStorePool
     if (this.messageStore.getMessageStoreConfig().isTransientStorePoolEnable()) {
     	//启动快速失败策略时，计算TransientStorePool中剩余的buffer数量减去requestQueue中待分配的数量后，剩余的buffer数量
         if (this.messageStore.getMessageStoreConfig().isFastFailIfNoBufferInStorePool()
             && BrokerRole.SLAVE != this.messageStore.getMessageStoreConfig().getBrokerRole()) { //if broker is slave, don't fast fail even no buffer in pool
+            //计算堆外内存还剩下多少 availableBuffers 是一个ByteBuffer类型的队列
             canSubmitRequests = this.messageStore.getTransientStorePool().remainBufferNumbs() - this.requestQueue.size();
         }
     }
@@ -562,7 +577,7 @@ public MappedFile putRequestAndReturnMappedFile(String nextFilePath, String next
 }
 ```
 
-将创建请求插入到requestQueue和requestTable中，由于优先级队列中requestQueue存入的是AllocateRequest对象实现了compareTo方法，优先级的排序，由于创建MappedFile时传入的是预创建两个，我们需要创建最新的请求的结果，其他请求需要进行排队。
+将创建请求插入到requestQueue和requestTable中，由于优先级队列requestQueue存入的是AllocateRequest对象，它实现了compareTo方法，存在优先级。在创建MappedFile时传入的是预创建两个，优先创建最新的请求，其他请求需要进行排队。
 
 AllocateMappedFileService是个多线程类，内部实现了run()的核心方法mmapOperation()
 
@@ -590,7 +605,7 @@ private boolean mmapOperation() {
             long beginTime = System.currentTimeMillis();
  
             MappedFile mappedFile;
-            //判断TransientStorePoolEnable是否启用
+            //判断TransientStorePoolEnable是否启用 采用堆外内存
             if (messageStore.getMessageStoreConfig().isTransientStorePoolEnable()) {
                 try {
                     mappedFile = ServiceLoader.load(MappedFile.class).iterator().next();
@@ -602,7 +617,7 @@ private boolean mmapOperation() {
             } else {
                 mappedFile = new MappedFile(req.getFilePath(), req.getFileSize());
             }
- 
+
             long eclipseTime = UtilAll.computeEclipseTimeMilliseconds(beginTime);
             if (eclipseTime > 10) {
                 int queueSize = this.requestQueue.size();
@@ -638,15 +653,14 @@ private boolean mmapOperation() {
         }
     } finally {
         if (req != null && isSuccess)
+            //唤醒putRequestAndReturnMappedFile方法中的线程
             req.getCountDownLatch().countDown();
     }
     return true;
 }
 ```
 
-我们发现有两种方式创建mappedFile对象
-
-1、mappedFile = new MappedFile(req.getFilePath(), req.getFileSize())
+在mmapOperation中存在两种方式创建mappedFile对象，mappedFile = new MappedFile(req.getFilePath(), req.getFileSize())
 
 ```java
 public MappedFile(final String fileName, final int fileSize) throws IOException {
@@ -684,12 +698,11 @@ private void init(final String fileName, final int fileSize) throws IOException 
 
 MappedByteBuffer实际上使用的是虚拟内存，当虚拟内存的使用超过物理内存大小时，势必会造成内存交换，这就会导致在内存使用的过程中进行磁盘IO，而且它不一定是顺序磁盘IO，所以会很慢。而且虚拟内存的交换是由操作系统控制的，系统中的其他进程活动，也会触发RocketMQ内存映射的内存交换。此外，因为文件内存映射的写入过程实际上是写入 PageCache，这就涉及到 PageCache  的锁竞争，而如果直接写入内存的话就不存在该竞争，在异步刷盘的场景下可以达到更快的速度。综上RocketMQ就对其进行了优化，该优化使用transientStorePoolEnable参数控制。
 
-如果transientStorePoolEnable为true，则初始化MappedFile的writeBuffer，该buffer从transientStorePool中获取。
-
-2、mappedFile = ServiceLoader.load(MappedFile.class).iterator().next();  mappedFile.init(req.getFilePath(), req.getFileSize(),  messageStore.getTransientStorePool())
+如果transientStorePoolEnable为true，则初始化MappedFile的writeBuffer，该buffer从transientStorePool中获取，如下第二种方式创建mappedFile :
 
 ```java
-//transientStorePoolEnable 为 true
+ //MappedFile 类
+//transientStorePoolEnable 为 true 
 public void init(final String fileName, final int fileSize,
     final TransientStorePool transientStorePool) throws IOException {
     init(fileName, fileSize);
@@ -713,8 +726,6 @@ public void init() {
     }
 }
 ```
-
-
 
 从上的代码，我们可以看出该内存池的内存实际上用的也是直接内存，把要存储的数据先存入该buffer中，然后再需要刷盘的时候，将该buffer的数据传入FileChannel，这样就和MappedByteBuffer一样能做到零拷贝了。除此之外，该Buffer还使用了com.sun.jna.Library类库将该批内存锁定，避免被置换到交换区，提高存储性能。
 
@@ -783,6 +794,7 @@ public AppendMessageResult appendMessagesInner(final MessageExt messageExt, fina
         //设置指针
         byteBuffer.position(currentPos);
         AppendMessageResult result = null;
+        //追加消息
         if (messageExt instanceof MessageExtBrokerInner) {
             result = cb.doAppend(this.getFileFromOffset(), byteBuffer, this.fileSize - currentPos, (MessageExtBrokerInner) messageExt);
         } else if (messageExt instanceof MessageExtBatch) {
@@ -1248,5 +1260,3 @@ private static ByteBuffer viewed(ByteBuffer buffer) {
 ```
 
 从上面的代码中我们可以看出 cleanup 先是进行了一些验证，然后就通过多个反射过程进行 MappedByteBuffer 的回收。
-
-### 
