@@ -90,22 +90,41 @@ struct sdshdr{
 }    
 ```
 
-1、字符串对象
+* type：type 记录了对象的类型，所有的类型如下
 
-字符串对象的编码可以是int、raw或者embstr。如果一个字符串的内容可以转换为long，那么该字符串就会被转换成为long类型，对象的ptr就会指向该long，并且对象类型也用int类型表示。
-普通的字符串有两种，embstr和raw。如果字符串对象的长度小于39字节，就用embstr对象。否则用传统的raw对象。
+![](../images/redis/8.png)
 
-embstr的好处有如下几点：
+对于 Redis 数据库保存的键值对来说，键一定是一个字符串对象，而值则可以使五种对象的其中一种。
 
-1. raw编码方式采用两次分配内存的方式，分别创建redisObject和sdshdr，而embstr编码方式则是采用一次分配，分配一个连续的空间给redisObject和sdshdr。
-2. 相对地，释放内存的次数也由两次变为一次。
-3. embstr的objet和sds放在一起，更好地利用缓存带来的优势。
+* ptr 指针：指向对象的底层实现数据结构
 
-raw和embstr的区别可以用下面两幅图所示：
+* encoding：表示 ptr 指向的具体数据结构，即这个对象使用了什么数据结构作为底层实现。
 
-![](../images/redis/4.png)
+![](../images/redis/9.png)
 
-2、列表对象
+1、字符串对象：字符串对象的 encoding 有三种，分别是：int、raw、embstr。
+
+1. 如果一个字符串对象保存的是整数值，并且这个整数值可以用 long 类型标识，那么字符串对象会讲整数值保存在 ptr 属性中，并将 encoding 设置为 int。
+    假设有如下命令：set number 10086。那么 number 键对象的示意图如下
+
+![](../images/redis/10.png)
+
+2. 如果字符串对象保存的是一个字符串值，并且这个字符串的长度大于 32 字节，那么字符串对象将使用一个简单动态字符串（SDS）来保存这个字符串值，并将对象的编码设置为 raw。
+
+![](../images/redis/11.png)
+
+3. 如果字符串对象保存的是一个字符串值，并且这个字符串的长度小于等于 32 字节，那么字符串对象将使用 embstr 编码的方式来保存这个字符串。
+
+![](../images/redis/12.png)
+
+既然有了 raw 的编码方式，为什么还会有 embstr 的编码方式呢？
+ 因为 embstr 的编码方式有一些优点，如下：
+
+- embstr 编码将创建字符串对象所需的内存分配次数从 raw 编码的两次降低为一次。
+- 释放 embstr 编码的字符串对象只需要调用一次内存释放函数，而释放 raw 编码的字符串对象需要调用两次内存释放函数。
+- 因为 embstr 编码的字符串对象的所有数据都保存在一块连续的内存里面，所以这种编码的字符串对象比起 raw ，编码的字符串对象能够更好地利用缓存带来的优势。
+
+2、列表对象(list)
 
 ```
 redis 127.0.0.1:6379> LPUSH runoobkey redis
@@ -131,13 +150,23 @@ redis 127.0.0.1:6379> LRANGE runoobkey 0 10
 
    `ziplist`  虽然不维护前后节点的指针，但是它却维护了上一个节点的长度和当前节点的长度，然后每次通过长度来计算出前后节点的位置。既然涉及到了计算，那么相对于直接存储指针的方式肯定有性能上的损耗，这就是一种典型的用时间来换取空间的做法。因为每次读取前后节点都需要经过计算才能得到前后节点的位置，所以会消耗更多的时间，而在 `Redis` 中，一个指针是占了 `8` 个字节，但是大部分情况下，如果直接存储长度是达不到 `8` 个字节的，所以采用存储长度的设计方式在大部分场景下是可以节省内存空间的。
 
-   ![](../images/redis/5.png)
+   ![](../images/redis/13.png)
 
    * zlbytes: ziplist的长度（单位: 字节)，是一个32位无符号整数
    * zltail: ziplist最后一个节点的偏移量，反向遍历ziplist或者pop尾部节点的时候有用。
    * zllen: ziplist的节点（entry）个数
    * entry: 节点，节点的长度由节点保存的内容决定
    * zlend: 值为0xFF，用于标记ziplist的结尾
+
+   **entry**
+
+   ![](../images/redis/14.png)
+
+   * previous_entry_length：上一个entry的大小。
+
+   * encoding：记录content的类型以及长度。
+
+   * content：一个整形或者字节数组。
 
 2. linkedlist是一种双向链表。它的结构比较简单，节点中存放pre和next两个指针，还有节点相关的信息。当每增加一个node的时候，就需要重新malloc一块内存
 
@@ -159,19 +188,17 @@ redis 127.0.0.1:6379> LRANGE runoobkey 0 10
    8) "23000"
    ```
 
-   
-
    哈希对象的底层实现可以是ziplist或者hashtable。
-   ziplist中的哈希对象是按照key1,value1,key2,value2这样的顺序存放来存储的。当对象数目不多且内容不大时，这种方式效率是很高的。
-
+ziplist中的哈希对象是按照key1,value1,key2,value2这样的顺序存放来存储的。当对象数目不多且内容不大时，这种方式效率是很高的。
+   
    hashtable数据结构参考前面的哈希表结构。
 
    **①、哈希算法：**Redis计算哈希值和索引值方法如下：
 
    ```
-   #1、使用字典设置的哈希函数，计算键 key 的哈希值``hash = dict->type->hashFunction(key);``#2、使用哈希表的sizemask属性和第一步得到的哈希值，计算索引值``index = hash & dict->ht[x].sizemask;
+#1、使用字典设置的哈希函数，计算键 key 的哈希值``hash = dict->type->hashFunction(key);``#2、使用哈希表的sizemask属性和第一步得到的哈希值，计算索引值``index = hash & dict->ht[x].sizemask;
    ```
-
+   
    **②、解决哈希冲突：**这个问题上面我们介绍了，方法是链地址法。通过字典里面的 *next 指针指向下一个具有相同索引值的哈希表节点。
 
    **③、扩容和收缩：**当哈希表保存的键值对太多或者太少时，就要通过 rehash(重新散列）来对哈希表进行相应的扩展或者收缩。具体步骤：
@@ -275,7 +302,15 @@ redis 127.0.0.1:6379> LRANGE runoobkey 0 10
    有序集合的编码可能两种，一种是ziplist，另一种是skiplist与dict的结合。
    ziplist作为集合和作为哈希对象是一样的，member和score顺序存放。按照score从小到大顺序排列
 
+   - [score,value]键值对数量少于128个；
+- 每个元素的长度小于64字节；
+   
    ![](../images/redis/7.png)
-
+   
    skiplist是一种跳跃表，它实现了有序集合中的快速查找，在大多数情况下它的速度都可以和平衡树差不多。但它的实现比较简单，可以作为平衡树的替代品。它的结构比较特殊。
+   
+   - hash用来存储value到score的映射，这样就可以在O(1)时间内找到value对应的分数；
+   - skipList按照从小到大的顺序存储分数；
+   - skipList每个元素的值都是[score,value]对
 
+![](../images/redis/15.png)
