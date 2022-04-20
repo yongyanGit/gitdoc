@@ -51,7 +51,7 @@ leave_region:
 
 ```
 enter_region:
-        MOVE REGISTER,#1                            | 把 1 放在内存器中
+        MOVE REGISTER,#1                            | 把 1 放在寄存器中
         XCHG REGISTER,LOCK                        | 交换寄存器和锁变量的内容
         CMP REGISTER,#0                            | 锁是 0 吗？
         JNE enter_region                                    | 若不是 0 ，锁已被设置，进行循环
