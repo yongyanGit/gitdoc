@@ -25,11 +25,7 @@ IOC-Inversion of Control 即控制反转，用户自己不进行对象的创建�
 
 * ListableBeanFactory：提供接口可以枚举所有的对象而不是根据名称来查询某一个对象。
 
-* HierarchicalBeanFactory ：子对象可以继承一个工厂类，形成父子级联IoC容器的接口。通过setParentBeanFactory方法可
-
-* 
-
-* 以设置父工厂类。
+* HierarchicalBeanFactory ：子对象可以继承一个工厂类，形成父子级联IoC容器的接口。通过setParentBeanFactory方法可以设置父工厂类。
 
   ```java
   //返回父工厂
